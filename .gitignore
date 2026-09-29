@@ -1,0 +1,31 @@
+# Local tenant bindings contain organization and access information.
+scripts/cadm/tenants/*/
+!scripts/cadm/tenants/example/
+
+# Generated audit material and local runtime artifacts.
+audit/
+reports/
+clone-*.json
+profile-*-to-*.json
+ad-actions-*.ps1
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+.env.*
+*.pfx
+*.p12
+*.key
+
+# Release packaging and machine-local credentials
+dist/
+publish/
+*.log
+*.pem
+*.p7b
+*.p8
+*.jks
+credentials*.json
+.azure/
+.mg/

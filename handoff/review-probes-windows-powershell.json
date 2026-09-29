@@ -1,0 +1,46 @@
+[
+    {
+        "Probe":  "Role GUID bypasses standing Owner name restriction",
+        "Observed":  "ACCEPTED"
+    },
+    {
+        "Probe":  "Scope alias bypasses root scope restriction",
+        "Observed":  "/"
+    },
+    {
+        "Probe":  "Standing group membership never checks PIM enrollment",
+        "Observed":  "CREATE"
+    },
+    {
+        "Probe":  "Denied RBAC read becomes a CREATE plan",
+        "Observed":  "CREATE"
+    },
+    {
+        "Probe":  "Failed active group read still reports complete PIM state",
+        "Observed":  "Ok=True; activeCount=0"
+    },
+    {
+        "Probe":  "Throttled Azure activation read does not mark state unknown",
+        "Observed":  "Denied=False; activationCount=0"
+    },
+    {
+        "Probe":  "Existing Graph context accepted without tenant comparison",
+        "Observed":  "Connected=True"
+    },
+    {
+        "Probe":  "Subscription inventory retains multiple tenants",
+        "Observed":  "SubscriptionCount=2"
+    },
+    {
+        "Probe":  "Explicit group duration bypasses policy ceiling",
+        "Observed":  "P365D"
+    },
+    {
+        "Probe":  "Graph pagination cap reports incomplete results as successful",
+        "Observed":  "Ok=True"
+    },
+    {
+        "Probe":  "Fresh apply connection drops directory scopes and fragments group scopes",
+        "Observed":  "Requested=PrivilegedAccess.ReadWrite.AzureADGroup"
+    }
+]
