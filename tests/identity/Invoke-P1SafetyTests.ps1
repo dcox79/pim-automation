@@ -241,6 +241,45 @@ Test-Case 'Existing unconditional Reader remains idempotent' {
     Assert-True ($rows.Count -eq 1 -and $rows[0].Action -eq 'SKIP-EXISTS') 'Existing Reader was not recognized.'
 }
 
+foreach ($sessionMode in @('legacy', 'policy-read', 'policy-write', 'manual', 'denied')) {
+    Test-Case "Graph policy permission session: $sessionMode" {
+        $ConnectGraph = $sessionMode -ne 'manual'; $Apply = $true; $UseDeviceCode = $true
+        $MgScopeList = @($MgWriteScopeList)
+        $script:connectCalls = 0; $script:requestedScopes = @()
+        $script:sessionScopes = @('PrivilegedEligibilitySchedule.Read.AzureADGroup', 'Group.Read.All')
+        if ($sessionMode -eq 'policy-read') { $script:sessionScopes += 'RoleManagementPolicy.Read.AzureADGroup' }
+        if ($sessionMode -eq 'policy-write') { $script:sessionScopes += 'RoleManagementPolicy.ReadWrite.AzureADGroup' }
+        function Get-Module { return $true }
+        function Import-Module { }
+        function Get-MgContext { [pscustomobject]@{ Account = 'synthetic@example.com'; TenantId = $script:actualTenant; Environment = 'Global'; Scopes = $script:sessionScopes } }
+        function Connect-MgGraph {
+            [CmdletBinding()]
+            param([string[]]$Scopes, [string]$TenantId, [string]$Environment, [string]$ContextScope, [switch]$UseDeviceCode)
+            Assert-True ($TenantId -eq $script:ExpectedTenantId -and $Environment -eq 'Global' -and $ContextScope -eq 'Process') 'Reconnect lost tenant/cloud binding.'
+            $script:connectCalls++; $script:requestedScopes = $Scopes
+            $script:sessionScopes = $Scopes
+        }
+        function Invoke-MgGraphRequest {
+            param($Method, $Uri, $Body, $ErrorAction)
+            Assert-True ($Method -eq 'GET') 'Authentication test attempted Graph mutation.'
+            if ($Uri -match '/policies/' -and ($sessionMode -eq 'denied' -or
+                -not @($script:sessionScopes | Where-Object { $_ -in @('RoleManagementPolicy.Read.AzureADGroup', 'RoleManagementPolicy.ReadWrite.AzureADGroup') }).Count)) { throw '403 policy read denied' }
+            return @{ value = @() }
+        }
+        Connect-GraphIfNeeded -ProbePrincipalId source
+        $expectedConnections = if ($sessionMode -in @('legacy', 'denied')) { 1 } else { 0 }
+        Assert-True ($script:connectCalls -eq $expectedConnections) 'Legacy session was reused or a sufficient session reconnected unnecessarily.'
+        if ($expectedConnections) { Assert-True ($script:requestedScopes -contains 'RoleManagementPolicy.Read.AzureADGroup') 'Reconnect omitted policy-read scope.' }
+        if ($sessionMode -in @('manual', 'denied')) {
+            Assert-Throws { Add-CadmStandingGroupMember -GroupId group -PrincipalId target }
+            Assert-True ($script:writes -eq 0) 'Unavailable policy permission permitted a grant.'
+        } else {
+            Add-CadmStandingGroupMember -GroupId group -PrincipalId target
+            Assert-True ($script:writes -eq 1) 'Ordinary group grant failed after permission handling.'
+        }
+    }
+}
+
 # Execute the complete clone entry point with only its transport/bootstrap replaced.
 # Keep its real StrictMode, planning, preflight, apply loop, and tenant enforcement.
 foreach ($scenario in @('normal', 'condition', 'target-condition', 'eligibility-condition', 'activation-error', 'expiring-assigned', 'tenant-switch')) {

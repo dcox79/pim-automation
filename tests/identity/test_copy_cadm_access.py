@@ -349,7 +349,7 @@ def test_connect_verifies_the_session_with_a_real_call():
     Verification must therefore be a real call. Checking the reported scope list instead is what
     let that session pass -- see test_existing_graph_session_is_probed_not_trusted."""
     assert "Test-MgPlaneUsable -PrincipalId $ProbePrincipalId" in CODE
-    assert "PIM for Groups is still refused" in SRC
+    assert "PIM eligibility or policy-read permission is still unavailable" in SRC
     # The real Graph error must surface, not just a bare status.
     assert "probe: $($script:MgProbeError)" in CODE
 
@@ -661,9 +661,10 @@ def test_existing_graph_session_is_probed_not_trusted():
     exactly that tenant. The operator's own connect defeated the workaround."""
     assert "function Test-MgPlaneUsable" in CODE
     assert "Test-MgPlaneUsable -PrincipalId $ProbePrincipalId" in CODE
-    # The accept-existing-session branch must not gate on the reported scope list.
+    # Reported scopes may require reconnect, but never replace the real eligibility probe.
     connect_fn = CODE[CODE.index("function Connect-GraphIfNeeded"):CODE.index("function Get-MgPimRoleStatus")]
-    assert "Test-MgHasScope" not in connect_fn
+    assert "Test-MgHasScope -Acceptable $policyReadScopes" in connect_fn
+    assert "$policyScopeOk -and (Test-MgPlaneUsable -PrincipalId $ProbePrincipalId)" in connect_fn
     # A session that fails the probe must be dropped; scopes cannot be added in place.
     assert "Disconnect-MgGraph" in connect_fn
 

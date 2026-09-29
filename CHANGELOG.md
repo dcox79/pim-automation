@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Reconnect older Graph sessions missing group policy-read permission; preserve sufficient read/read-write sessions and fail closed on denied policy reads.
+
 - Block standing membership in PIM-managed or unverifiable groups at planning and write time.
 - Refuse incomplete relevant discovery, including active schedules, throttling, malformed data, and partial pages.
 - Block conditional RBAC/resource-PIM copying and expiring active assignments instead of broadening access.

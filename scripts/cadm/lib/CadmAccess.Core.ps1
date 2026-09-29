@@ -14,7 +14,7 @@
 # Top-level statements here run in the caller too - including the $Interactive override and the
 # $MgScopeList computation - so an entry script that never defines those params simply gets the
 # defaults.
-$CadmCoreVersion = '1.5.0 (2026-09-29)'
+$CadmCoreVersion = '1.5.1 (2026-09-29)'
 
 $GraphBase = 'https://graph.microsoft.com/v1.0'
 $ArmBase   = 'https://management.azure.com'
@@ -365,6 +365,9 @@ function Connect-GraphIfNeeded {
         return
     }
 
+    # A missing policy scope requires re-consent even when eligibility reads succeed.
+    # Reported scopes are only a reconnect hint; actual policy reads still fail closed.
+    $policyReadScopes = @('RoleManagementPolicy.Read.AzureADGroup', 'RoleManagementPolicy.ReadWrite.AzureADGroup')
     $ctx = $null
     try { $ctx = Get-MgContext } catch { $ctx = $null }
     if ($ctx -and (Test-MgConnected)) {
@@ -375,11 +378,13 @@ function Connect-GraphIfNeeded {
         # SKIPPED the broader-scope retry below: the manual connect defeated the workaround
         # written for precisely that tenant. Cost of certainty is one cheap GET.
         [void](Test-MgConnected)   # refresh the reported-scope cache for the diagnostic line
-        if (Test-MgPlaneUsable -PrincipalId $ProbePrincipalId) {
+        $policyScopeOk = Test-MgHasScope -Acceptable $policyReadScopes
+        if (-not $policyScopeOk) { $script:MgProbeError = 'Session lacks RoleManagementPolicy.Read.AzureADGroup (or ReadWrite); reconnecting with policy-read permission.' }
+        if ($policyScopeOk -and (Test-MgPlaneUsable -PrincipalId $ProbePrincipalId)) {
             Write-Host "  graph: already connected as $($ctx.Account)"
             return
         }
-        Write-Host "  graph: connected as $($ctx.Account), but the session cannot read PIM for Groups."
+        Write-Host "  graph: connected as $($ctx.Account), but the session lacks policy-read permission or cannot read PIM for Groups."
         if ($script:MgProbeError) { Write-Host "         probe: $($script:MgProbeError)" }
         Write-Host '         Reconnecting.'
         # Do NOT Disconnect-MgGraph here. v1.14 did, and when every reconnect attempt also failed
@@ -442,11 +447,13 @@ function Connect-GraphIfNeeded {
                 # Verify with a real call, not with the reported scope list - what was ASKED for
                 # is not necessarily what was granted, and the reported list can echo the request.
                 [void](Test-MgConnected)
-                if (Test-MgPlaneUsable -PrincipalId $ProbePrincipalId) {
+                $policyScopeOk = Test-MgHasScope -Acceptable $policyReadScopes
+                if (-not $policyScopeOk) { $script:MgProbeError = 'Connected session still lacks group policy-read permission.' }
+                if ($policyScopeOk -and (Test-MgPlaneUsable -PrincipalId $ProbePrincipalId)) {
                     Write-Host "  graph: connected as $($ctx.Account)"
                     $connected = $true
                 } else {
-                    Write-Host "  graph: connected as $($ctx.Account) but PIM for Groups is still refused."
+                    Write-Host "  graph: connected as $($ctx.Account) but PIM eligibility or policy-read permission is still unavailable."
                     if ($script:MgProbeError) { Write-Host "         probe: $($script:MgProbeError)" }
                 }
                 break
