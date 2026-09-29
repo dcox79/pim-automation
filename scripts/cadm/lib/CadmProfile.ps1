@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 
 # CadmProfile.ps1 - tenant binding, profile loading, and the profile-apply grant path for the
 # CADM access tooling. Dot-sourced by Invoke-CadmAccess.ps1, which dot-sources CadmAccess.Core.ps1
@@ -10,7 +10,7 @@
 # expiration-mirroring the clone path carries. A separate, smaller grant path means adding
 # profiles cannot regress the field-tested clone behaviour (its pinned tests).
 
-$CadmProfileVersion = '1.4.0 (2026-08-20)'
+$CadmProfileVersion = '1.5.0 (2026-09-29)'
 
 function Import-CadmTenant {
     # Match the CURRENT az login's tenantId against scripts/cadm/tenants/*/tenant.psd1 and return
@@ -26,6 +26,7 @@ function Import-CadmTenant {
     foreach ($f in $files) {
         $t = Import-PowerShellDataFile -Path $f
         if ([string]$t.TenantId -ieq $liveTid) {
+            Set-CadmTenant -TenantId $t.TenantId
             $t.Path = $f
             $t.ProfilesDir = Join-Path (Split-Path $f) 'profiles'
             return $t
@@ -74,8 +75,9 @@ function Assert-ProfileSafe {
     $name = $Profile.Name
     foreach ($r in (Get-ProfileEntries $Profile.Data.Rbac)) {
         $role = [string]$r.Role
-        $scope = [string]$r.Scope
-        if ($role -in @('Owner', 'User Access Administrator', 'Role Based Access Control Administrator')) {
+        $scope = Resolve-CadmScope -Scope ([string]$r.Scope) -Tenant $Tenant
+        if ($role.Trim() -in @('Owner', 'User Access Administrator', 'Role Based Access Control Administrator') -or
+            (Get-RoleDefGuid $role.Trim()) -in @('8e3af657-a8ff-443c-a75c-2fe8c4bcb635', '18d7d88d-d35e-4fb5-a5c3-7773c20a72d9', 'f58310d9-a9f6-439a-9e8d-f62e7b41a168')) {
             throw "profile '$name': standing '$role' is not allowed - grant it just-in-time via a PIM-for-Groups eligibility instead."
         }
         if ($scope -eq '/' -or $scope -eq $RootScope) {
@@ -112,13 +114,54 @@ function Assert-ProfileSafe {
 }
 
 function Resolve-CadmScope {
-    # A profile scope is either a tenant.psd1 ScopeTokens key or a full resource id. '/' is
-    # rejected here too - defence in depth behind Assert-ProfileSafe.
     param([string]$Scope, [hashtable]$Tenant)
-    if ($Tenant.ScopeTokens -and $Tenant.ScopeTokens.ContainsKey($Scope)) { return [string]$Tenant.ScopeTokens[$Scope] }
+    if ((Get-CadmField $Tenant 'ScopeTokens') -and $Tenant.ScopeTokens.ContainsKey($Scope)) { $Scope = [string]$Tenant.ScopeTokens[$Scope] }
     if ($Scope -eq '/') { throw "root scope '/' is not allowed." }
-    if ($Scope -match '^/subscriptions/|^/providers/') { return $Scope }
-    throw "unresolved scope '$Scope' - not a ScopeTokens key in tenant.psd1 and not a /subscriptions or /providers resource id."
+    # Reject ambiguous URI representations before any cloud lookup or write.
+    if ($Scope -match '[%?#\\\s]' -or $Scope -match '//|/(\.|\.\.)(/|$)' -or $Scope.EndsWith('/')) {
+        throw 'Non-canonical ARM scope is not allowed.'
+    }
+    if ($Scope -match '^/subscriptions/[0-9a-fA-F-]{36}(?:/resourceGroups/[^/]+(?:/providers/[^/]+(?:/[^/]+/[^/]+)+)?)?$' -or
+        $Scope -match '^/providers/Microsoft.Management/managementGroups/[^/]+$') { return $Scope }
+    throw "unresolved scope '$Scope' - use a canonical subscription, resource, or management-group scope."
+}
+
+function Resolve-CadmStandingRole {
+    param([string]$Role, [string]$Scope)
+    Assert-CadmScopeTenant -Scope $Scope
+    $defs = @(Invoke-AzJson -AzArgs @('role', 'definition', 'list', '--name', $Role.Trim(), '--scope', $Scope, '-o', 'json'))
+    if ($script:LastAzError -or $defs.Count -ne 1 -or $null -eq $defs[0]) { throw 'Cannot uniquely resolve standing role definition.' }
+    $def = $defs[0]
+    $id = Get-RoleDefGuid ([string](Get-CadmField $def 'id'))
+    $guid = [guid]::Empty
+    if (-not [guid]::TryParse($id, [ref]$guid) -or $guid -eq [guid]::Empty) { throw 'Role definition has no canonical ID.' }
+    if ($id -in @('8e3af657-a8ff-443c-a75c-2fe8c4bcb635', '18d7d88d-d35e-4fb5-a5c3-7773c20a72d9', 'f58310d9-a9f6-439a-9e8d-f62e7b41a168')) {
+        throw 'Privileged role cannot be assigned standing by a profile.'
+    }
+    $permissions = @(Get-CadmField $def 'permissions')
+    if (-not $permissions.Count -or $null -eq $permissions[0]) { throw 'Role permissions are unreadable.' }
+    # Custom role semantics can change after preview. Only provably read-only custom
+    # roles are supported, and definitions are re-read immediately before each grant.
+    $type = [string](Get-CadmField $def 'roleType')
+    if ($type -notin @('BuiltInRole', 'CustomRole')) { throw 'Unknown role definition type.' }
+    foreach ($perm in $permissions) {
+        $actions = @(Get-CadmField $perm 'actions')
+        if ($type -eq 'CustomRole') {
+            foreach ($action in @($actions) + @(Get-CadmField $perm 'dataActions')) {
+                if ($action -and $action -notmatch '^[a-zA-Z0-9.*_-]+(?:/[a-zA-Z0-9.*_-]+)*/read$') {
+                    throw 'Custom standing roles must be read-only; use a reviewed eligibility for other permissions.'
+                }
+            }
+        }
+        foreach ($danger in @('Microsoft.Authorization/roleAssignments/write', 'Microsoft.Authorization/roleDefinitions/write',
+            'Microsoft.Authorization/elevateAccess/action', 'Microsoft.Authorization/roleEligibilityScheduleRequests/write',
+            'Microsoft.Authorization/roleAssignmentScheduleRequests/write')) {
+            $allowed = @($actions | Where-Object { $_ -and $danger -like $_ }).Count -gt 0
+            $excluded = @((Get-CadmField $perm 'notActions') | Where-Object { $_ -and $danger -like $_ }).Count -gt 0
+            if ($allowed -and -not $excluded) { throw 'Standing role can administer access; use eligibility.' }
+        }
+    }
+    return $id
 }
 
 function Resolve-GroupByName {
@@ -151,23 +194,29 @@ function Resolve-ProfilePlan {
     # someone is removed from that group.
     foreach ($r in (Get-ProfileEntries $Profile.Data.Rbac)) {
         $scope = Resolve-CadmScope -Scope ([string]$r.Scope) -Tenant $Tenant
+        $roleId = Resolve-CadmStandingRole -Role ([string]$r.Role) -Scope $scope
         $have = Invoke-AzJson -AzArgs @('role', 'assignment', 'list', '--assignee', $Target.id,
                                         '--scope', $scope, '-o', 'json')
+        if ($script:LastAzError) { throw "Cannot read target RBAC: $script:LastAzError" }
         $direct = @($have | Where-Object {
             [string]$_.principalId -eq $Target.id -and
-            [string]$_.roleDefinitionName -eq [string]$r.Role -and
+            (Get-RoleDefGuid $_.roleDefinitionId) -eq $roleId -and
             [string]$_.scope -eq $scope })
+        if (@($direct | Where-Object { Test-CadmConditionalAssignment $_ }).Count) { throw 'Existing conditional RBAC must be reviewed; cannot replace it with standing unconditional access.' }
         $action = if ($direct.Count) { 'SKIP-EXISTS' } else { 'CREATE' }
-        $rows.Add([pscustomobject]@{ Plane='RBAC'; Action=$action; Item=[string]$r.Role; Scope=$scope; Detail=[string]$r.Role })
+        $rows.Add([pscustomobject]@{ Plane='RBAC'; Action=$action; Item=[string]$r.Role; Scope=$scope; Detail=$roleId })
     }
 
     # --- Plain group membership ---
     $tgtGroupIds = @{}
-    foreach ($g in (Get-GroupsFor -PrincipalId $Target.id)) { $tgtGroupIds[$g.id] = $true }
+    if (@(Get-ProfileEntries $Profile.Data.GroupMemberships).Count) {
+        foreach ($g in (Get-GroupsFor -PrincipalId $Target.id)) { $tgtGroupIds[$g.id] = $true }
+    }
     foreach ($gm in (Get-ProfileEntries $Profile.Data.GroupMemberships)) {
         $g = Resolve-GroupByName -Name ([string]$gm.Group)
         if ($g.onPremisesSyncEnabled) { throw "profile group '$($gm.Group)' is on-prem synced - membership must be set in AD, not via a profile." }
         if ($g.isAssignableToRole) { throw "profile group '$($gm.Group)' is role-assignable - grant it as a PIM eligibility, not standing membership." }
+        Assert-CadmStandingGroup -GroupId $g.id
         $action = if ($tgtGroupIds.ContainsKey($g.id)) { 'SKIP-EXISTS' } else { 'CREATE' }
         $rows.Add([pscustomobject]@{ Plane='GROUP'; Action=$action; Item=$g.displayName; Scope=$g.id; Detail='cloud-only' })
     }
@@ -233,14 +282,16 @@ function Invoke-ProfileGrant {
     foreach ($item in @($Rows | Where-Object { $_.Action -eq 'CREATE' })) {
         switch ($item.Plane) {
             'RBAC' {
+                $canonicalScope = Resolve-CadmScope -Scope $item.Scope -Tenant @{}
+                $roleId = Resolve-CadmStandingRole -Role $item.Detail -Scope $canonicalScope
                 $null = Invoke-AzJson -AzArgs @('role', 'assignment', 'create',
                     '--assignee-object-id', $Target.id, '--assignee-principal-type', 'User',
-                    '--role', $item.Detail, '--scope', $item.Scope, '-o', 'json')
+                    '--role', $roleId, '--scope', $canonicalScope, '-o', 'json')
                 if ($script:LastAzError) { Write-Host "  [FAIL] RBAC    $($item.Item) @ $($item.Scope): $script:LastAzError"; $fail++ }
                 else { Write-Host "  [OK]   RBAC    $($item.Item) @ $($item.Scope)"; $ok++ }
             }
             'GROUP' {
-                $null = Invoke-AzJson -AzArgs @('ad', 'group', 'member', 'add', '--group', $item.Scope, '--member-id', $Target.id)
+                Add-CadmStandingGroupMember -GroupId $item.Scope -PrincipalId $Target.id
                 if ($script:LastAzError) { Write-Host "  [FAIL] GROUP   $($item.Item): $script:LastAzError"; $fail++ }
                 else { Write-Host "  [OK]   GROUP   $($item.Item)"; $ok++ }
             }

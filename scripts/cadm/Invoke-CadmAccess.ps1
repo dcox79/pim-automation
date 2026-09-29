@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 
 <#
 .SYNOPSIS
@@ -167,7 +167,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$LauncherVersion = '1.2.0 (2026-08-20)'
+$LauncherVersion = '1.3.0 (2026-09-29)'
 
 . (Join-Path $PSScriptRoot 'lib\CadmAccess.Core.ps1')
 . (Join-Path $PSScriptRoot 'lib\CadmProfile.ps1')
@@ -248,7 +248,7 @@ if ($Mode -in @('clone', 'interactive')) {
     $clone = Join-Path (Split-Path $PSScriptRoot -Parent) 'Copy-CadmAccess.ps1'
     if (-not (Test-Path $clone)) { throw "clone script not found at $clone" }
 
-    $splat = @{ SourceUser = $SourceUser; TargetUser = $TargetUser; ConnectGraph = $ConnectGraph }
+    $splat = @{ TenantId = $tenant.TenantId; SourceUser = $SourceUser; TargetUser = $TargetUser; ConnectGraph = $ConnectGraph }
     if ($Mode -eq 'interactive') { $splat.Interactive = $true }
     elseif ($Apply)              { $splat.Apply = $true }
     if ($Force)         { $splat.Force = $true }

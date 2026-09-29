@@ -213,7 +213,8 @@ def test_autoconnect_reconnects_an_unusable_session():
     serve both. The trigger is now a failed PROBE rather than a scope-list comparison -- the
     list could echo the request, so it accepted sessions that did not work."""
     assert "Test-MgPlaneUsable -PrincipalId $ProbePrincipalId" in CODE
-    assert "$scopeSets = if ($Apply) { @($MgWriteScopeList) } else { @($MgReadScopeList, $MgWriteScopeList) }" in CODE
+    assert "$scopeSets.Add(@($MgScopeList))" in CODE
+    assert "$MgScopeList + $MgWriteScopeList" in CODE
     assert "Reconnecting." in SRC
     assert "Retrying with the broader scope set" in SRC
 
@@ -285,7 +286,8 @@ def test_activated_pim_elevation_not_cloned_as_permanent_rbac():
     Observed live 2026-08-17: Owner at Tenant Root Group, assignmentType=Activated, twelve
     hours from expiry, planned as a permanent CREATE. assignmentType is the discriminator."""
     assert "function Get-PimActivatedFor" in CODE
-    assert "$p.assignmentType -ne 'Activated'" in CODE
+    assert "$p.assignmentType -notin @('Activated', 'Assigned')" in CODE
+    assert "Get-CadmField $p 'endDateTime'" in CODE
     assert "SKIP-PIM-ACTIVATED" in CODE
     # must be checked before the CREATE path, or it never fires
     assert CODE.index("SKIP-PIM-ACTIVATED") < CODE.index("$tgtRaKeys.ContainsKey($cmp)")
@@ -319,7 +321,7 @@ def test_subscription_list_is_refreshed():
     looks complete while missing every grant in the subscriptions it never examined."""
     assert "'account', 'list', '--refresh', '--all'" in CODE
     # a failed refresh must degrade loudly, not silently fall back to a stale list
-    assert "subscription refresh failed" in SRC
+    assert "could not refresh subscriptions" in SRC
 
 
 def test_signin_falls_back_to_device_code_automatically():
@@ -354,7 +356,8 @@ def test_connect_verifies_the_session_with_a_real_call():
 
 def test_connect_falls_back_to_the_broader_scope_set():
     """Least privilege first, but a tenant that only consents ReadWrite must still work."""
-    assert "$scopeSets = if ($Apply) { @($MgWriteScopeList) } else { @($MgReadScopeList, $MgWriteScopeList) }" in CODE
+    assert "$scopeSets.Add(@($MgScopeList))" in CODE
+    assert "$MgScopeList + $MgWriteScopeList" in CODE
     assert "Retrying with the broader scope set" in SRC
 
 
@@ -471,7 +474,7 @@ def test_include_pim_active_grants_eligibility_not_standing_access():
     lapsing, so copying its end date would mint an eligibility that expires almost immediately."""
     assert "[switch]$IncludePimActive" in CODE
     assert "granted as an ELIGIBILITY, not standing access" in SRC
-    assert "Plane='PIM-GRP'; Action='CREATE'" in CODE
+    assert "Plane='PIM-GRP'; Action=$(if ($tgtPimGrp.Ok) { 'CREATE' } else { 'BLOCKED-PIM-UNKNOWN' })" in CODE
     # accessId must be carried, not guessed: member vs owner is not inferable.
     assert "$srcPimGrp.ActiveMap[$g.id]" in CODE
     assert "ActiveMap = $active" in CODE

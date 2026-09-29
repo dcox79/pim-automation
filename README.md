@@ -3,7 +3,7 @@
 PowerShell tools to preview and grant access from reusable tenant profiles or an existing user's assignments.
 This is the full provisioning project. The separate [PIM Eligibility Checker](https://github.com/dcox79/pim-eligibility-checker) only inspects eligibility.
 
-**Preview release — known access-safety gaps remain.** Read the [project review](handoff/project-review.md) before using `-Apply`.
+**Preview — P1 fixes are under offline validation; P2 access-safety gaps remain.** Read the [project review](handoff/project-review.md) before using `-Apply`.
 Offline tests do not establish safe live provisioning. Interactive clone mode implicitly enables writes.
 
 ## Included
@@ -49,17 +49,23 @@ az login --tenant '<your-tenant-guid>'
 .\scripts\cadm\Invoke-CadmAccess.ps1 -Mode profile -ProfileName reader-only -TargetUser target-admin@example.com
 
 # Preview cloning an existing user:
-.\scripts\Copy-CadmAccess.ps1 -SourceUser source-admin@example.com -TargetUser target-admin@example.com
+.\scripts\Copy-CadmAccess.ps1 -TenantId '<your-tenant-guid>' -SourceUser source-admin@example.com -TargetUser target-admin@example.com
 ```
 
 Normal profile/clone commands preview by default. After reviewing the plan and known issues,
 `-Apply` enables grants and normally requires typing `APPLY`. `-Force` bypasses that confirmation.
 Interactive mode enables apply implicitly. Apply is additive and does not roll back partial grants.
 
-The launcher checks the Azure CLI tenant against configuration, but Graph/Azure tenant isolation
-is incomplete. The direct clone entry point bypasses launcher binding. Verify both sessions and
-resolved identities before applying. Read failures, RBAC condition handling, template restrictions,
-and PIM membership handling also have documented gaps.
+The launcher binds the configured tenant; direct cloning now requires an explicit `-TenantId`.
+Azure and Graph operations require the same public-cloud tenant, and writes recheck scope ownership.
+Incomplete relevant reads block apply. Conditional RBAC/resource-PIM assignments are reported as
+`BLOCKED-CONDITIONAL` rather than copied without their restrictions. Standing group grants recheck
+PIM policy and reject PIM-managed, role-assignable, synced, dynamic, or unverifiable groups.
+Custom standing profile roles are limited to read-only permissions; built-in roles that administer
+access are rejected by resolved ID and permissions. Noncanonical scopes are rejected.
+
+The tool does not assess every privilege conveyed through an ordinary group or provide transactional
+rollback. Follow the remaining review findings; offline success does not establish production readiness.
 
 ## Privacy
 
@@ -75,10 +81,14 @@ python -m pip install -r requirements-dev.txt
 python -B -m pytest -q -p no:cacheprovider tests/identity
 pwsh -NoProfile -File tests/identity/Invoke-ReviewProbes.ps1
 powershell -NoProfile -File tests/identity/Invoke-ReviewProbes.ps1
+pwsh -NoProfile -File tests/identity/Invoke-P1SafetyTests.ps1
+powershell -NoProfile -File tests/identity/Invoke-P1SafetyTests.ps1
 ```
 
-The 95 Python tests inspect source text. The 11 mocked review probes reproduce known gaps;
-they are not passing safety checks. No live grants are exercised. Live provisioning remains unverified.
+The 95 Python tests inspect source text. Behavioral P1 tests exercise the real planning/write
+boundaries and clone entry point with mocked transports. Historical review probes now show both
+blocked paths and remaining P2 issues; their saved JSON files are the original pre-fix evidence.
+No live grants are exercised. Live provisioning remains unverified.
 
 See the [operator runbook](handoff/copy-cadm-access.md), [review](handoff/project-review.md),
 and [changelog](CHANGELOG.md).
