@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 # CadmAccess.Core.ps1 - the shared CADM access engine: az/Graph plumbing, session probing,
 # principal/group resolvers, RBAC + Azure-resource-PIM + PIM-for-Groups discovery, and the
 # progress/reporting helpers. Consumed by Copy-CadmAccess.ps1 and Invoke-CadmAccess.ps1.
@@ -14,7 +14,7 @@
 # Top-level statements here run in the caller too - including the $Interactive override and the
 # $MgScopeList computation - so an entry script that never defines those params simply gets the
 # defaults.
-$CadmCoreVersion = '1.4.0 (2026-08-20)'
+$CadmCoreVersion = '1.5.1 (2026-09-29)'
 
 $GraphBase = 'https://graph.microsoft.com/v1.0'
 $ArmBase   = 'https://management.azure.com'
@@ -22,6 +22,7 @@ $PimApi    = '2020-10-01'
 $RootScope = '/'
 $MgScopes  = ''   # display form, joined from $MgScopeList once that is declared below
 
+$script:ExpectedTenantId = ''
 $script:LastAzError = ''
 $script:AzExe = $null
 $script:AzPrefix = @()
@@ -37,12 +38,14 @@ $script:PimGroupEnumError = ''
 $MgReadScopeList = @(
     'PrivilegedEligibilitySchedule.Read.AzureADGroup',
     'PrivilegedAccess.Read.AzureADGroup',
+    'RoleManagementPolicy.Read.AzureADGroup',
     'Group.Read.All',
     'User.Read.All'
 )
 $MgWriteScopeList = @(
     'PrivilegedAccess.ReadWrite.AzureADGroup',
     'PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup',
+    'RoleManagementPolicy.Read.AzureADGroup',
     'Group.Read.All',
     'User.Read.All'
 )
@@ -118,6 +121,140 @@ $MgWriteScopes = @('PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup', 'Priv
 # Plumbing
 # ---------------------------------------------------------------------------
 
+
+function Get-CadmField {
+    param($Object, [string]$Name)
+    if ($null -eq $Object) { return $null }
+    if ($Object -is [System.Collections.IDictionary]) { return $Object[$Name] }
+    if ($Object.PSObject.Properties[$Name]) { return $Object.$Name }
+    return $null
+}
+
+function Test-CadmField {
+    param($Object, [string]$Name)
+    if ($null -eq $Object) { return $false }
+    if ($Object -is [System.Collections.IDictionary]) { return $Object.Contains($Name) -and $null -ne $Object[$Name] }
+    return $null -ne $Object.PSObject.Properties[$Name] -and $null -ne $Object.$Name
+}
+
+function Set-CadmTenant {
+    param([string]$TenantId)
+    $id = [guid]::Empty
+    if (-not [guid]::TryParse($TenantId, [ref]$id) -or $id -eq [guid]::Empty) {
+        throw 'A real, explicit TenantId GUID is required.'
+    }
+    $script:ExpectedTenantId = $id.ToString()
+    Assert-CadmAzContext
+}
+
+function Assert-CadmAzContext {
+    if (-not $script:ExpectedTenantId) { throw 'Tenant binding is required before accessing cloud data.' }
+    $acct = Invoke-AzJsonRaw -AzArgs @('account', 'show', '-o', 'json')
+    if (-not $acct -or (Get-CadmField $acct 'tenantId') -ine $script:ExpectedTenantId -or
+        (Get-CadmField $acct 'environmentName') -ne 'AzureCloud') {
+        throw 'Azure session tenant/cloud does not match the bound public-cloud tenant.'
+    }
+}
+
+function Assert-CadmGraphContext {
+    if (-not $script:ExpectedTenantId) { throw 'Tenant binding is required before accessing Graph.' }
+    $ctx = Get-MgContext
+    if (-not $ctx -or (Get-CadmField $ctx 'TenantId') -ine $script:ExpectedTenantId -or
+        (Get-CadmField $ctx 'Environment') -ne 'Global') {
+        throw 'Graph session tenant/cloud does not match the bound public-cloud tenant.'
+    }
+}
+
+function Assert-CadmScopeTenant {
+    param([string]$Scope)
+    Assert-CadmAzContext
+    if ($Scope -eq '/') { return }
+    if ($Scope -match '[%?#\\\s]' -or $Scope -match '//|/(\.|\.\.)(/|$)' -or $Scope.EndsWith('/')) { throw 'Non-canonical ARM scope.' }
+    if ($Scope -match '^/subscriptions/([0-9a-f-]{36})(?:/|$)') {
+        $acct = Invoke-AzJsonRaw -AzArgs @('account', 'show', '--subscription', $Matches[1], '-o', 'json')
+        if (-not $acct -or (Get-CadmField $acct 'tenantId') -ine $script:ExpectedTenantId -or
+            (Get-CadmField $acct 'environmentName') -ne 'AzureCloud') {
+            throw 'Scope subscription is not verified in the bound tenant.'
+        }
+        return
+    }
+    if ($Scope -match '^/providers/Microsoft.Management/managementGroups/([^/]+)$') {
+        $name = [uri]::EscapeDataString($Matches[1])
+        $r = Invoke-Rest -Url "$ArmBase/providers/Microsoft.Management/managementGroups/$name`?api-version=2020-05-01"
+        if (-not $r -or (Get-CadmField (Get-CadmField $r 'properties') 'tenantId') -ine $script:ExpectedTenantId) {
+            throw 'Management group is not verified in the bound tenant.'
+        }
+        return
+    }
+    throw "Unsupported or malformed ARM scope '$Scope'."
+}
+
+function Assert-CadmApiUri {
+    param([string]$Uri, [string[]]$Hosts)
+    $u = $null
+    if (-not [uri]::TryCreate($Uri, [UriKind]::Absolute, [ref]$u) -or
+        $u.Scheme -ne 'https' -or $u.Host -notin $Hosts -or $u.Port -ne 443 -or $u.UserInfo -or $u.Fragment) {
+        throw 'Unexpected cloud API URL.'
+    }
+}
+
+function Invoke-AzJson {
+    param([string[]]$AzArgs)
+    # Bootstrap account inspection is read-only; every data operation requires binding.
+    if ($AzArgs[0] -notin @('account', 'cloud')) { Assert-CadmAzContext }
+    if ($AzArgs.Count -ge 3 -and $AzArgs[0] -eq 'role' -and $AzArgs[1] -eq 'assignment' -and $AzArgs[2] -eq 'create') {
+        $index = [array]::IndexOf($AzArgs, '--scope')
+        if ($index -lt 0 -or $index + 1 -ge $AzArgs.Count) { throw 'Explicit assignment scope required.' }
+        Assert-CadmScopeTenant -Scope $AzArgs[$index + 1]
+    }
+    return Invoke-AzJsonRaw -AzArgs $AzArgs
+}
+
+function Invoke-CadmRestAll {
+    param([string]$Url)
+    $all = @(); $next = $Url; $seen = @{}
+    while ($next) {
+        if ($seen.ContainsKey($next) -or $seen.Count -ge 100) { throw 'Incomplete REST pagination.' }
+        $seen[$next] = $true
+        $r = Invoke-Rest -Url $next
+        $values = Get-CadmField $r 'value'
+        if ($script:LastAzError -or $null -eq $r -or -not (Test-CadmField $r 'value') -or $r.value -isnot [System.Collections.IList]) { throw "Incomplete REST read: $script:LastAzError" }
+        $all += @($values)
+        $next = [string](Get-CadmField $r 'nextLink')
+        if (-not $next) { $next = [string](Get-CadmField $r '@odata.nextLink') }
+    }
+    return $all
+}
+
+function Test-CadmConditionalAssignment {
+    param($Assignment)
+    return (-not [string]::IsNullOrWhiteSpace([string](Get-CadmField $Assignment 'condition')) -or
+            -not [string]::IsNullOrWhiteSpace([string](Get-CadmField $Assignment 'conditionVersion')))
+}
+
+function Assert-CadmStandingGroup {
+    param([string]$GroupId)
+    $g = Invoke-Rest -Url "$GraphBase/groups/$GroupId`?`$select=id,isAssignableToRole,onPremisesSyncEnabled,groupTypes"
+    if (-not $g -or (Get-CadmField $g 'id') -ne $GroupId -or
+        $null -eq (Get-CadmField $g 'isAssignableToRole') -or -not (Test-CadmField $g 'groupTypes')) {
+        throw 'Cannot verify group governance; standing membership blocked.'
+    }
+    if ((Get-CadmField $g 'isAssignableToRole') -or (Get-CadmField $g 'onPremisesSyncEnabled') -or
+        @((Get-CadmField $g 'groupTypes')) -contains 'DynamicMembership') {
+        throw 'Role-assignable, synced, or dynamic group cannot receive standing membership.'
+    }
+    $r = Invoke-MgJsonAll -Uri "$GraphBase/policies/roleManagementPolicyAssignments?`$filter=scopeId eq '$GroupId' and scopeType eq 'Group'"
+    if (-not $r.Ok) { throw "Cannot verify PIM governance; standing membership blocked: $($r.Error)" }
+    if (@($r.Value).Count) { throw 'PIM-managed group cannot receive standing membership; use eligibility.' }
+}
+
+function Add-CadmStandingGroupMember {
+    param([string]$GroupId, [string]$PrincipalId)
+    # Re-read governance at the write boundary, even after a previously safe plan.
+    Assert-CadmStandingGroup -GroupId $GroupId
+    $null = Invoke-AzJson -AzArgs @('ad', 'group', 'member', 'add', '--group', $GroupId, '--member-id', $PrincipalId)
+}
+
 function Initialize-AzInvoker {
     # On Windows `az` is az.cmd, which re-invokes python WITHOUT re-quoting its arguments.
     # cmd.exe therefore parses every argument, and the metacharacters '(', ')' and '&' break
@@ -144,7 +281,7 @@ function Initialize-AzInvoker {
     $script:AzPrefix = @()
 }
 
-function Invoke-AzJson {
+function Invoke-AzJsonRaw {
     # az wrapper returning parsed JSON or $null, never throwing on non-zero exit.
     # $script:LastAzError carries stderr so callers can tell "empty" from "denied" - a 403
     # must be surfaced, not silently rendered as "no assignments".
@@ -157,7 +294,15 @@ function Invoke-AzJson {
         return $null
     }
     $text = ($stdout | Out-String).Trim()
-    if (-not $text) { return $null }
+    if (-not $text) {
+        if (-not ($AzArgs.Count -ge 4 -and ($AzArgs[0..3] -join ' ') -eq 'ad group member add')) { $script:LastAzError = 'empty response' }
+        return $null
+    }
+    $isList = ($AzArgs.Count -ge 3 -and $AzArgs[0] -eq 'role' -and $AzArgs[2] -eq 'list') -or
+              ($AzArgs.Count -ge 2 -and $AzArgs[0] -eq 'account' -and $AzArgs[1] -eq 'list')
+    if ($text -eq 'null' -or ($isList -and -not $text.StartsWith('['))) {
+        $script:LastAzError = 'malformed JSON collection or null response'; return $null
+    }
     try { return $text | ConvertFrom-Json }
     catch { $script:LastAzError = "unparseable JSON: $text"; return $null }
 }
@@ -167,6 +312,10 @@ function Invoke-Rest {
     # the path, so parens and '&' survive intact. Do NOT percent-encode them here: the python
     # entry point forwards the URL as-is, and Graph rejects a literal '%28' in a filter clause.
     param([string]$Url, [string]$Method = 'get', [string]$BodyFile)
+    Assert-CadmApiUri -Uri $Url -Hosts @('graph.microsoft.com', 'management.azure.com')
+    if ($Method -notin @('get', 'head') -and $Url -match '^https://management[.]azure[.]com(.+)/providers/Microsoft.Authorization/roleEligibilityScheduleRequests/') {
+        Assert-CadmScopeTenant -Scope $Matches[1]
+    }
     $a = @('rest', '--method', $Method, '--url', $Url, '--only-show-errors')
     if ($BodyFile) { $a += @('--body', "@$BodyFile") }
     return Invoke-AzJson -AzArgs $a
@@ -187,6 +336,7 @@ function Test-MgConnected {
     try {
         $ctx = Get-MgContext
         if (-not $ctx) { return $false }
+        Assert-CadmGraphContext
         if ($ctx.PSObject.Properties['Scopes'] -and $ctx.Scopes) { $script:MgScopesHeld = @($ctx.Scopes) }
         return $true
     } catch { return $false }
@@ -215,9 +365,12 @@ function Connect-GraphIfNeeded {
         return
     }
 
+    # A missing policy scope requires re-consent even when eligibility reads succeed.
+    # Reported scopes are only a reconnect hint; actual policy reads still fail closed.
+    $policyReadScopes = @('RoleManagementPolicy.Read.AzureADGroup', 'RoleManagementPolicy.ReadWrite.AzureADGroup')
     $ctx = $null
     try { $ctx = Get-MgContext } catch { $ctx = $null }
-    if ($ctx) {
+    if ($ctx -and (Test-MgConnected)) {
         # PROBE the existing session rather than trusting its reported scopes. This branch used to
         # accept any session whose (Get-MgContext).Scopes looked right, which is how an operator
         # connecting by hand with the .Read scopes - in a tenant that only consents .ReadWrite -
@@ -225,11 +378,13 @@ function Connect-GraphIfNeeded {
         # SKIPPED the broader-scope retry below: the manual connect defeated the workaround
         # written for precisely that tenant. Cost of certainty is one cheap GET.
         [void](Test-MgConnected)   # refresh the reported-scope cache for the diagnostic line
-        if (Test-MgPlaneUsable -PrincipalId $ProbePrincipalId) {
+        $policyScopeOk = Test-MgHasScope -Acceptable $policyReadScopes
+        if (-not $policyScopeOk) { $script:MgProbeError = 'Session lacks RoleManagementPolicy.Read.AzureADGroup (or ReadWrite); reconnecting with policy-read permission.' }
+        if ($policyScopeOk -and (Test-MgPlaneUsable -PrincipalId $ProbePrincipalId)) {
             Write-Host "  graph: already connected as $($ctx.Account)"
             return
         }
-        Write-Host "  graph: connected as $($ctx.Account), but the session cannot read PIM for Groups."
+        Write-Host "  graph: connected as $($ctx.Account), but the session lacks policy-read permission or cannot read PIM for Groups."
         if ($script:MgProbeError) { Write-Host "         probe: $($script:MgProbeError)" }
         Write-Host '         Reconnecting.'
         # Do NOT Disconnect-MgGraph here. v1.14 did, and when every reconnect attempt also failed
@@ -256,7 +411,9 @@ function Connect-GraphIfNeeded {
     # requested scope is not consented - it connects with whatever it could get, so the session
     # may look healthy and then fail with Forbidden if the requested scopes are unavailable. So verify the token actually carries a usable
     # scope, and re-request with the consented set if not.
-    $scopeSets = if ($Apply) { @($MgWriteScopeList) } else { @($MgReadScopeList, $MgWriteScopeList) }
+    $scopeSets = [System.Collections.Generic.List[object]]::new()
+    $scopeSets.Add(@($MgScopeList))
+    if (-not $Apply) { $scopeSets.Add(@($MgScopeList + $MgWriteScopeList | Select-Object -Unique)) }
     $attempts = if ($UseDeviceCode) { @($true) } else { @($false, $true) }
     $connected = $false
     for ($si = 0; $si -lt $scopeSets.Count; $si++) {
@@ -272,7 +429,7 @@ function Connect-GraphIfNeeded {
             # device-code switch is spelled differently across builds - 2.36.1 exposes
             # -UseDeviceCode and has no -UseDeviceAuthentication, others are the reverse - so
             # probe for each rather than assuming a version mapping. -NoWelcome is newer-only.
-            $p = @{ Scopes = $MgScopeList; ErrorAction = 'Stop' }
+            $p = @{ Scopes = $MgScopeList; TenantId = $script:ExpectedTenantId; Environment = 'Global'; ContextScope = 'Process'; ErrorAction = 'Stop' }
             if ($cmd.Parameters.ContainsKey('NoWelcome')) { $p.NoWelcome = $true }
             if ($device) {
                 if ($cmd.Parameters.ContainsKey('UseDeviceCode')) { $p.UseDeviceCode = $true }
@@ -286,15 +443,17 @@ function Connect-GraphIfNeeded {
             # Any welcome banner is already suppressed by -NoWelcome where the SDK supports it.
             Connect-MgGraph @p
             $ctx = Get-MgContext
-            if ($ctx) {
+            if ($ctx -and (Test-MgConnected)) {
                 # Verify with a real call, not with the reported scope list - what was ASKED for
                 # is not necessarily what was granted, and the reported list can echo the request.
                 [void](Test-MgConnected)
-                if (Test-MgPlaneUsable -PrincipalId $ProbePrincipalId) {
+                $policyScopeOk = Test-MgHasScope -Acceptable $policyReadScopes
+                if (-not $policyScopeOk) { $script:MgProbeError = 'Connected session still lacks group policy-read permission.' }
+                if ($policyScopeOk -and (Test-MgPlaneUsable -PrincipalId $ProbePrincipalId)) {
                     Write-Host "  graph: connected as $($ctx.Account)"
                     $connected = $true
                 } else {
-                    Write-Host "  graph: connected as $($ctx.Account) but PIM for Groups is still refused."
+                    Write-Host "  graph: connected as $($ctx.Account) but PIM eligibility or policy-read permission is still unavailable."
                     if ($script:MgProbeError) { Write-Host "         probe: $($script:MgProbeError)" }
                 }
                 break
@@ -394,9 +553,12 @@ function Invoke-MgJson {
     # Returns @{ Ok; Value; Error }. Never throws - a denied plane is reported, not fatal.
     param([string]$Uri, [string]$Method = 'GET', [hashtable]$Body)
     try {
+        Assert-CadmGraphContext
+        Assert-CadmApiUri -Uri $Uri -Hosts @('graph.microsoft.com')
         $p = @{ Method = $Method; Uri = $Uri; ErrorAction = 'Stop' }
         if ($Body) { $p.Body = ($Body | ConvertTo-Json -Depth 10) }
         $r = Invoke-MgGraphRequest @p
+        if ($Method -eq 'GET' -and $Uri -match '\?' -and ($null -eq $r -or -not $r.ContainsKey('value') -or $r.value -isnot [System.Collections.IList])) { throw 'Malformed Graph collection response.' }
         $val = if ($r -and $r.ContainsKey('value')) { @($r.value) } else { @($r) }
         $next = if ($r -and $r.ContainsKey('@odata.nextLink')) { [string]$r['@odata.nextLink'] } else { '' }
         return @{ Ok = $true; Value = $val; Error = ''; Next = $next }
@@ -451,6 +613,7 @@ function Invoke-MgJsonAll {
         $all += $r.Value
         $next = $r.Next
     }
+    if ($next) { return @{ Ok = $false; Value = @(); Error = 'Incomplete Graph pagination (page limit).' } }
     return @{ Ok = $true; Value = $all; Error = '' }
 }
 
@@ -485,22 +648,14 @@ function Resolve-CadmUser {
 }
 
 function Get-Subscriptions {
-    # --refresh is REQUIRED, not an optimisation. The az CLI snapshots the subscription list at
-    # login and never updates it on its own, so a machine that logged in before a subscription
-    # existed will not see it - the same identity legitimately reports different counts on
-    # different machines when their cached subscription inventories differ.
-    #
-    # This script only scans what az hands it, so a stale cache silently produces a plan that
-    # looks complete while missing every grant in the subscriptions it never looked at. On a
-    # tool that clones privileged access, a quietly short plan is the worst failure mode.
+    Assert-CadmAzContext
     $subs = Invoke-AzJson -AzArgs @('account', 'list', '--refresh', '--all', '-o', 'json')
-    if (-not $subs) {
-        # Refresh needs a live token; fall back rather than failing the whole run, but say so.
-        Write-Host "  [WARN] subscription refresh failed ($script:LastAzError); using the cached list."
-        $subs = Invoke-AzJson -AzArgs @('account', 'list', '--all', '-o', 'json')
-    }
-    if (-not $subs) { throw "could not list subscriptions ($script:LastAzError)" }
-    return @($subs | ForEach-Object { [pscustomobject]@{ Id = $_.id; Name = $_.name } })
+    if ($script:LastAzError) { throw "could not refresh subscriptions ($script:LastAzError)" }
+    foreach ($sub in $subs) { if ($sub -and (-not (Get-CadmField $sub 'tenantId') -or -not (Get-CadmField $sub 'environmentName'))) { throw 'Subscription tenant/cloud metadata is missing.' } }
+    return @($subs | Where-Object { $_ -and (Get-CadmField $_ 'tenantId') -ieq $script:ExpectedTenantId -and
+        (Get-CadmField $_ 'environmentName') -eq 'AzureCloud' } | ForEach-Object {
+        [pscustomobject]@{ Id = $_.id; Name = $_.name; TenantId = $_.tenantId }
+    })
 }
 
 function Get-RoleDefGuid {
@@ -533,6 +688,7 @@ function Get-RoleAssignmentsFor {
         Step-Phase
         $rows = Invoke-AzJson -AzArgs @('role', 'assignment', 'list', '--assignee', $PrincipalId,
             '--subscription', $s.Id, '--all', '--include-inherited', '--include-groups', '-o', 'json')
+        if ($script:LastAzError) { throw "Incomplete RBAC discovery: $script:LastAzError" }
         if (-not $rows) { continue }
         foreach ($r in $rows) {
             $key = "$(Get-RoleDefGuid $r.roleDefinitionId)|$($r.scope)|$($r.principalId)".ToLower()
@@ -551,12 +707,9 @@ function Get-PimResourceFor {
         Step-Phase
         $url = "$ArmBase/subscriptions/$($s.Id)/providers/Microsoft.Authorization/roleEligibilityScheduleInstances" +
                "?api-version=$PimApi&`$filter=principalId eq '$PrincipalId'"
-        $r = Invoke-Rest -Url $url
-        if (-not $r) {
-            if ($script:LastAzError -match 'Forbidden|AuthorizationFailed') { $denied = $true }
-            continue
-        }
-        foreach ($v in @($r.value)) {
+        try { $values = @(Invoke-CadmRestAll -Url $url) }
+        catch { $denied = $true; continue }
+        foreach ($v in $values) {
             $p = $v.properties; $ep = $p.expandedProperties
             # Same subscription-prefix normalisation as Get-RoleAssignmentsFor - and here the
             # key doubles as the source-vs-target comparison key, so it must not carry a
@@ -568,6 +721,8 @@ function Get-PimResourceFor {
                     RoleName         = $ep.roleDefinition.displayName
                     Scope            = $ep.scope.id
                     EndDateTime      = $p.endDateTime
+                    condition        = Get-CadmField $p 'condition'
+                    conditionVersion = Get-CadmField $p 'conditionVersion'
                 }
             }
         }
@@ -591,14 +746,12 @@ function Get-PimActivatedFor {
         Step-Phase
         $url = "$ArmBase/subscriptions/$($s.Id)/providers/Microsoft.Authorization/roleAssignmentScheduleInstances" +
                "?api-version=$PimApi&`$filter=principalId eq '$PrincipalId'"
-        $r = Invoke-Rest -Url $url
-        if (-not $r) {
-            if ($script:LastAzError -match 'Forbidden|AuthorizationFailed') { $denied = $true }
-            continue
-        }
-        foreach ($v in @($r.value)) {
+        try { $values = @(Invoke-CadmRestAll -Url $url) }
+        catch { $denied = $true; continue }
+        foreach ($v in $values) {
             $p = $v.properties
-            if ($p.assignmentType -ne 'Activated') { continue }   # 'Assigned' is standing access
+            if ($p.assignmentType -notin @('Activated', 'Assigned')) { $denied = $true; continue }
+            if ($p.assignmentType -eq 'Assigned' -and -not (Get-CadmField $p 'endDateTime')) { continue }
             $ep = $p.expandedProperties
             $key = "$(Get-RoleDefGuid $p.roleDefinitionId)|$($ep.scope.id)".ToLower()
             if (-not $map.Contains($key)) {
@@ -678,7 +831,7 @@ function Get-PimGroupsFor {
     # So: try by-principal once (one call, and it works for a caller who does hold the
     # directory-wide permission), and fan out per group only when it is refused.
     param([string]$PrincipalId)
-    $out = [ordered]@{}; $active = @{}
+    $out = [ordered]@{}; $active = @{}; $fallback = $false
     $base = "$GraphBase/identityGovernance/privilegedAccess/group"
 
     $elig = Invoke-MgJsonAll -Uri "$base/eligibilityScheduleInstances?`$filter=principalId eq '$PrincipalId'"
@@ -686,10 +839,12 @@ function Get-PimGroupsFor {
     if ($elig.Ok) {
         $eligV = $elig.Value
         $a = Invoke-MgJsonAll -Uri "$base/assignmentScheduleInstances?`$filter=principalId eq '$PrincipalId'"
-        if ($a.Ok) { $asgV = $a.Value }
+        if (-not $a.Ok) { return @{ Ok = $false; Error = $a.Error; Map = $out; ActiveGroupIds = @(); ActiveMap = @{} } }
+        $asgV = $a.Value
     } else {
         # @(...) is load-bearing: `return @()` from a PowerShell function unrolls to nothing, so
         # an empty result arrives as $null and $groupIds.Count throws.
+        $fallback = $true
         $groupIds = @(Get-PimCandidateGroupIds -PrincipalId $PrincipalId)
         if (-not $groupIds.Count) {
             # Nothing to fall back to - report the ORIGINAL by-principal error, plus why the
@@ -705,7 +860,7 @@ function Get-PimGroupsFor {
             if (-not $e.Ok) { $failed++; $lastErr = $e.Error; continue }
             $eligV += @($e.Value)
             $a = Invoke-MgJsonAll -Uri "$base/assignmentScheduleInstances?`$filter=groupId eq '$gid'"
-            if ($a.Ok) { $asgV += @($a.Value) }
+            if ($a.Ok) { $asgV += @($a.Value) } else { $failed++; $lastErr = $a.Error }
         }
         End-Phase
         # A partial sweep must not pass as a complete read. Silently dropping groups here would
@@ -735,6 +890,7 @@ function Get-PimGroupsFor {
         # as an eligibility, and member-vs-owner is not guessable.
         $active[$a.groupId] = [string]$a.accessId
     }
+    if ($fallback) { return @{ Ok = $false; Error = 'Per-group fallback is partial principal coverage; apply blocked.'; Map = $out; ActiveGroupIds = @($active.Keys); ActiveMap = $active } }
     return @{ Ok = $true; Error = ''; Map = $out; ActiveGroupIds = @($active.Keys); ActiveMap = $active }
 }
 
@@ -923,10 +1079,8 @@ function Get-DirRoleExpirationRule {
 
 function Get-GroupsFor {
     param([string]$PrincipalId)
-    $r = Invoke-Rest -Url ("$GraphBase/users/$PrincipalId/memberOf/microsoft.graph.group" +
-                           "?`$select=id,displayName,onPremisesSyncEnabled,securityEnabled&`$top=999")
-    if (-not $r) { return @() }
-    return @($r.value)
+    return @(Invoke-CadmRestAll -Url ("$GraphBase/users/$PrincipalId/memberOf/microsoft.graph.group" +
+        "?`$select=id,displayName,onPremisesSyncEnabled,securityEnabled&`$top=999"))
 }
 
 function Test-GroupRoleAssignable {

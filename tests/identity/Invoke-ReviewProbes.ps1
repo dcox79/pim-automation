@@ -1,6 +1,6 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
-Offline review probes. These demonstrate CURRENT gaps, not successful safety checks.
+Historical review probes. Fixed paths now report refusals; remaining P2 paths still demonstrate gaps.
 No tenant connection or grant is performed. All API boundaries are replaced with mocks.
 Run: pwsh -NoProfile -File tests/identity/Invoke-ReviewProbes.ps1
 #>
@@ -20,10 +20,11 @@ function Invoke-Probe {
         function Invoke-MgJson { throw 'Unexpected Graph call in offline probe' }
         function Invoke-MgGraphRequest { throw 'Unexpected Graph SDK call in offline probe' }
         function Get-GroupsFor { return @() }
+        $script:ExpectedTenantId = '11111111-1111-1111-1111-111111111111'
         function Write-Host { }
         $target = @{ id = 'synthetic-target'; accountEnabled = $true }
-        $tenant = @{ ScopeTokens = @{ 'example-scope' = '/subscriptions/synthetic' } }
-        $observed = & $Check
+        $tenant = @{ ScopeTokens = @{ 'example-scope' = '/subscriptions/22222222-2222-2222-2222-222222222222' } }
+        try { $observed = & $Check } catch { $observed = "BLOCKED: $($_.Exception.Message)" }
         [pscustomobject]@{ Probe = $Name; Observed = $observed }
     }
 }
@@ -48,11 +49,13 @@ $results = @(
             @{ id = 'synthetic-pim-group'; displayName = 'Synthetic PIM group';
                onPremisesSyncEnabled = $false; isAssignableToRole = $false }
         }
-        function Get-PimGroupsFor { throw 'PIM enrollment was checked' }
+        function Invoke-Rest { @{ id = 'synthetic-pim-group'; isAssignableToRole = $false; onPremisesSyncEnabled = $false; groupTypes = @() } }
+        function Invoke-MgJsonAll { @{ Ok = $true; Value = @(@{ id = 'synthetic-policy' }) } }
         $p = @{ Data = @{ GroupMemberships = @(@{ Group = 'Synthetic PIM group' }) } }
         (Resolve-ProfilePlan -Profile $p -Target $target -Tenant $tenant -Subs @()).Action
     }
     Invoke-Probe 'Denied RBAC read becomes a CREATE plan' {
+        function Resolve-CadmStandingRole { return '33333333-3333-3333-3333-333333333333' }
         function Invoke-AzJson { $script:LastAzError = 'AuthorizationFailed'; return $null }
         $p = @{ Data = @{ Rbac = @(@{ Role = 'Reader'; Scope = 'example-scope' }) } }
         (Resolve-ProfilePlan -Profile $p -Target $target -Tenant $tenant -Subs @()).Action
@@ -78,9 +81,10 @@ $results = @(
         "Connected=$(Test-MgConnected)"
     }
     Invoke-Probe 'Subscription inventory retains multiple tenants' {
+        function Assert-CadmAzContext { }
         function Invoke-AzJson {
-            @(@{ id = 'sub-a'; name = 'Synthetic A'; tenantId = 'tenant-a' },
-              @{ id = 'sub-b'; name = 'Synthetic B'; tenantId = 'tenant-b' })
+            @(@{ id = 'sub-a'; name = 'Synthetic A'; tenantId = '11111111-1111-1111-1111-111111111111'; environmentName = 'AzureCloud' },
+              @{ id = 'sub-b'; name = 'Synthetic B'; tenantId = '44444444-4444-4444-4444-444444444444'; environmentName = 'AzureCloud' })
         }
         "SubscriptionCount=$(@(Get-Subscriptions).Count)"
     }
@@ -94,6 +98,7 @@ $results = @(
         "Ok=$($r.Ok)"
     }
     Invoke-Probe 'Fresh apply connection drops directory scopes and fragments group scopes' {
+        $script:ExpectedTenantId = '11111111-1111-1111-1111-111111111111'
         $Apply = $true
         $ConnectGraph = $true
         $UseDeviceCode = $true
@@ -106,9 +111,9 @@ $results = @(
         function Test-MgPlaneUsable { return $true }
         function Connect-MgGraph {
             [CmdletBinding()]
-            param([string[]]$Scopes, [switch]$UseDeviceCode)
+            param([string[]]$Scopes, [switch]$UseDeviceCode, [string]$TenantId, [string]$Environment, [string]$ContextScope)
             $script:probeRequestedScopes = $Scopes
-            $script:probeContext = [pscustomobject]@{ Account = 'synthetic@example.com'; Scopes = $Scopes }
+            $script:probeContext = [pscustomobject]@{ Account = 'synthetic@example.com'; Scopes = $Scopes; TenantId = $TenantId; Environment = $Environment }
         }
         Connect-GraphIfNeeded -ProbePrincipalId 'synthetic-target'
         "Requested=$($script:probeRequestedScopes -join ',')"

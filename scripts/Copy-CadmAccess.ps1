@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 
 <#
 .SYNOPSIS
@@ -35,7 +35,7 @@
 
   1. Dry run. Reads, diffs, prints the plan, writes audit JSON. Changes NOTHING:
 
-       .\scripts\Copy-CadmAccess.ps1 -SourceUser source-admin -TargetUser target-admin
+       .\scripts\Copy-CadmAccess.ps1 -TenantId '<your-tenant-guid>' -SourceUser source-admin -TargetUser target-admin
 
      Sign-in falls back on its own: it tries the browser, and if that does not complete (normal
      on VDI and locked-down desktops) it retries with a device code - a URL and code you finish
@@ -57,7 +57,7 @@
 
   3. Apply. Prompts for a typed APPLY confirmation unless -Force:
 
-       .\scripts\Copy-CadmAccess.ps1 -SourceUser source-admin -TargetUser target-admin -Apply
+       .\scripts\Copy-CadmAccess.ps1 -TenantId '<your-tenant-guid>' -SourceUser source-admin -TargetUser target-admin -Apply
 
   4. Finish the on-prem half. Synced groups cannot be written from Azure; the run emits an
      ad-actions-<target>-<stamp>.ps1 next to the audit JSON. Run it where the ActiveDirectory
@@ -115,6 +115,9 @@
       same scope share one policy. There is nothing user-specific to copy; the target inherits
       the identical policy automatically.
 
+.PARAMETER TenantId
+    Explicit intended public-cloud tenant GUID. Azure and Graph contexts must match it.
+
 .PARAMETER SourceUser   Template account. UPN, objectId, or UPN prefix (e.g. 'source-admin').
 .PARAMETER TargetUser   Account to grant. Same accepted forms.
 .PARAMETER Apply        Perform the grants. Omit for a dry run (the default).
@@ -153,11 +156,11 @@
                         the record of a privileged grant survives a checkout or clean rebuild.
 
 .EXAMPLE
-  .\scripts\Copy-CadmAccess.ps1 -SourceUser source-admin -TargetUser target-admin
+  .\scripts\Copy-CadmAccess.ps1 -TenantId '<your-tenant-guid>' -SourceUser source-admin -TargetUser target-admin
   Dry run. Prints the plan, writes audit JSON, changes nothing.
 
 .EXAMPLE
-  .\scripts\Copy-CadmAccess.ps1 -SourceUser source-admin -TargetUser target-admin -Apply
+  .\scripts\Copy-CadmAccess.ps1 -TenantId '<your-tenant-guid>' -SourceUser source-admin -TargetUser target-admin -Apply
 
 .NOTES
   CADM UPN domains are inconsistent (source-admin@example.com vs
@@ -188,6 +191,7 @@
 
 [CmdletBinding()]
 param(
+    [Parameter(Mandatory = $true)][guid]$TenantId,
     [Parameter(Mandatory = $true)][string]$SourceUser,
     [Parameter(Mandatory = $true)][string]$TargetUser,
     [switch]$Apply,
@@ -219,7 +223,7 @@ Set-StrictMode -Version Latest
 # from a checkout, so "which version am I holding?" cannot be answered by git. Bump this on any
 # behavioural change; the banner is then the fastest way to tell a stale copy from a current
 # one - three separate troubleshooting rounds were spent on a copy that predated a safety fix.
-$ScriptVersion = '1.23.0 (2026-08-19)'
+$ScriptVersion = '1.24.0 (2026-09-29)'
 
 
 # The engine lives in scripts/cadm/lib/CadmAccess.Core.ps1 (see the header there for why it is
@@ -236,6 +240,7 @@ Write-Host "Copy-CadmAccess v$ScriptVersion (core v$CadmCoreVersion)"
 Write-Host "  source='$SourceUser' target='$TargetUser' apply=$($Apply.IsPresent) $(Get-Date -Format o)"
 
 Initialize-AzInvoker
+Set-CadmTenant -TenantId $TenantId.ToString()
 Write-Host "  az invoker: $script:AzExe"
 
 # Fail fast on a missing az session. Everything downstream - user lookup, subscriptions, RBAC,
@@ -256,7 +261,7 @@ if (-not $tgt.accountEnabled) { throw "target '$($tgt.userPrincipalName)' is DIS
 Write-Host "  source: $($src.displayName) <$($src.userPrincipalName)> $($src.id)"
 Write-Host "  target: $($tgt.displayName) <$($tgt.userPrincipalName)> $($tgt.id)"
 
-$subs = Get-Subscriptions
+$subs = @(Get-Subscriptions)
 Write-Host "  scanning $($subs.Count) subscription(s) - five sweeps, roughly $([int]($subs.Count * 5 * 2.5 / 60)) min"
 
 # ---------------------------------------------------------------------------
@@ -315,7 +320,7 @@ if (-not $SkipGroups) {
         $srcPimGrp = Get-PimGroupsFor -PrincipalId $src.id
         $tgtPimGrp = Get-PimGroupsFor -PrincipalId $tgt.id
     }
-    $srcGroups   = Get-GroupsFor -PrincipalId $src.id
+    $srcGroups   = @(Get-GroupsFor -PrincipalId $src.id)
     $tgtGroupIds = @((Get-GroupsFor -PrincipalId $tgt.id) | ForEach-Object { $_.id })
 }
 
@@ -350,7 +355,7 @@ $tgtRaKeys = @{}
 foreach ($k in $tgtRa.Keys) {
     $t = $tgtRa[$k]
     if ($t.principalType -eq 'Group') { continue }
-    $tgtRaKeys["$(Get-RoleDefGuid $t.roleDefinitionId)|$($t.scope)".ToLower()] = $true
+    $tgtRaKeys["$(Get-RoleDefGuid $t.roleDefinitionId)|$($t.scope)".ToLower()] = $(if (Test-CadmConditionalAssignment $t) { 'conditional' } else { 'unconditional' })
 }
 
 foreach ($key in $srcRa.Keys) {
@@ -363,6 +368,11 @@ foreach ($key in $srcRa.Keys) {
     if ($r.scope -eq $RootScope -and -not $AllowRootScope) {
         $plan.Add([pscustomobject]@{ Plane='RBAC'; Action='EXCLUDED-ROOT'; Item=$r.roleDefinitionName
                                      Scope=$r.scope; Detail='root scope; pass -AllowRootScope to include' })
+        continue
+    }
+    if (Test-CadmConditionalAssignment $r) {
+        $plan.Add([pscustomobject]@{ Plane='RBAC'; Action='BLOCKED-CONDITIONAL'; Item=$r.roleDefinitionName
+            Scope=$r.scope; Detail='Conditional assignments cannot be safely cloned by this version.' })
         continue
     }
     $cmp = "$(Get-RoleDefGuid $r.roleDefinitionId)|$($r.scope)".ToLower()
@@ -387,7 +397,7 @@ foreach ($key in $srcRa.Keys) {
         continue
     }
     $plan.Add([pscustomobject]@{
-        Plane='RBAC'; Action=$(if ($tgtRaKeys.ContainsKey($cmp)) { 'SKIP-EXISTS' } else { 'CREATE' })
+        Plane='RBAC'; Action=$(if ($tgtRaKeys[$cmp] -eq 'conditional') { 'BLOCKED-CONDITIONAL' } elseif ($tgtRaKeys.ContainsKey($cmp)) { 'SKIP-EXISTS' } else { 'CREATE' })
         Item=$r.roleDefinitionName; Scope=$r.scope; Detail=(Get-RoleDefGuid $r.roleDefinitionId) })
 }
 
@@ -399,7 +409,7 @@ foreach ($key in $srcPim.Map.Keys) {
         continue
     }
     $plan.Add([pscustomobject]@{
-        Plane='PIM-RES'; Action=$(if ($tgtPim.Map.Contains($key)) { 'SKIP-EXISTS' } else { 'CREATE' })
+        Plane='PIM-RES'; Action=$(if ((Test-CadmConditionalAssignment $e) -or ($tgtPim.Map.Contains($key) -and (Test-CadmConditionalAssignment $tgtPim.Map[$key]))) { 'BLOCKED-CONDITIONAL' } elseif ($tgtPim.Denied) { 'BLOCKED-PIM-UNKNOWN' } elseif ($tgtPim.Map.Contains($key)) { 'SKIP-EXISTS' } else { 'CREATE' })
         Item=$e.RoleName; Scope=$e.Scope
         Detail=$(if ($e.EndDateTime) { "until $($e.EndDateTime)" } else { 'no expiry' }) })
 }
@@ -408,7 +418,7 @@ if (-not $SkipGroups -and $srcPimGrp.Ok) {
     foreach ($key in $srcPimGrp.Map.Keys) {
         $e = $srcPimGrp.Map[$key]
         $plan.Add([pscustomobject]@{
-            Plane='PIM-GRP'; Action=$(if ($tgtPimGrp.Ok -and $tgtPimGrp.Map.Contains($key)) { 'SKIP-EXISTS' } else { 'CREATE' })
+            Plane='PIM-GRP'; Action=$(if (-not $tgtPimGrp.Ok) { 'BLOCKED-PIM-UNKNOWN' } elseif ($tgtPimGrp.Map.Contains($key)) { 'SKIP-EXISTS' } else { 'CREATE' })
             Item="$(Get-GroupName -GroupId $e.GroupId) [$($e.AccessId)]"; Scope=$e.GroupId
             AccessId=$e.AccessId
             Detail=$(if ($e.EndDateTime) { "until $($e.EndDateTime)" } else { 'no expiry' }) })
@@ -435,7 +445,7 @@ foreach ($g in $srcGroups) {
         if ($IncludePimActive) {
             $acc = if ($srcPimGrp.ActiveMap -and $srcPimGrp.ActiveMap[$g.id]) { $srcPimGrp.ActiveMap[$g.id] } else { 'member' }
             $plan.Add([pscustomobject]@{
-                Plane='PIM-GRP'; Action='CREATE'; Item="$($g.displayName) [$acc]"; Scope=$g.id
+                Plane='PIM-GRP'; Action=$(if ($tgtPimGrp.Ok) { 'CREATE' } else { 'BLOCKED-PIM-UNKNOWN' }); Item="$($g.displayName) [$acc]"; Scope=$g.id
                 AccessId=$acc
                 Detail='promoted from BLOCKED-PIM-ACTIVE by -IncludePimActive; granted as an ELIGIBILITY, not standing access' })
             continue
@@ -464,6 +474,7 @@ foreach ($g in $srcGroups) {
         $adActions.Add("Add-ADGroupMember -Identity '$($g.displayName)' -Members '$(($tgt.userPrincipalName -split '@')[0])'")
         continue
     }
+    Assert-CadmStandingGroup -GroupId $g.id
     $plan.Add([pscustomobject]@{ Plane='GROUP'; Action='CREATE'; Item=$g.displayName; Scope=$g.id; Detail='cloud-only' })
 }
 
@@ -509,7 +520,7 @@ if ($notCloned.Count) {
         Write-Host ''
         Write-Host '  Second step - clone the PIM-ACTIVE groups as eligibilities:'
         $extra = if ($Apply) { ' -Apply' } else { '' }
-        Write-Host "    .\scripts\Copy-CadmAccess.ps1 -SourceUser $SourceUser -TargetUser $TargetUser -IncludePimActive$extra"
+        Write-Host "    .\scripts\Copy-CadmAccess.ps1 -TenantId '<your-tenant-guid>' -SourceUser $SourceUser -TargetUser $TargetUser -IncludePimActive$extra"
     }
     Write-Host ''
 }
@@ -627,6 +638,11 @@ if (-not $Apply) {
     Write-Host "DRY RUN - nothing changed. $($todo.Count) grant(s) would be created."
     Write-Host 'Re-run with -Apply to perform them.'
     return
+}
+if ($srcPim.Denied -or $tgtPim.Denied -or $srcActivated.Denied -or
+    (-not $SkipGroups -and (-not $srcPimGrp.Ok -or -not $tgtPimGrp.Ok)) -or
+    @($plan | Where-Object { $_.Action -eq 'BLOCKED-PIM-UNKNOWN' }).Count) {
+    throw 'REFUSING TO APPLY: relevant discovery is incomplete.'
 }
 if ($todo.Count -eq 0) { Write-Host ''; Write-Host 'Nothing to do - target already matches.'; return }
 
@@ -818,7 +834,7 @@ foreach ($item in $todo) {
             else { Write-Host "  [FAIL] PIM-GRP $($item.Item): $($r.Error)"; $failCount++ }
         }
         'GROUP' {
-            $null = Invoke-AzJson -AzArgs @('ad', 'group', 'member', 'add', '--group', $item.Scope, '--member-id', $tgt.id)
+            Add-CadmStandingGroupMember -GroupId $item.Scope -PrincipalId $tgt.id
             if ($script:LastAzError) { Write-Host "  [FAIL] GROUP   $($item.Item): $script:LastAzError"; $failCount++ }
             else { Write-Host "  [OK]   GROUP   $($item.Item)"; $okCount++ }
         }

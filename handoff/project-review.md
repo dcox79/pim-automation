@@ -3,6 +3,25 @@
 **Assessment:** useful operator tooling, but not ready for unattended privileged provisioning.
 Fix the safety gaps before adding a GUI or more automation.
 
+## P1 remediation in the working version — 2026-09-29
+
+The five P1 paths below have candidate fixes and behavioral regressions in
+`tests/identity/Invoke-P1SafetyTests.ps1`. The original findings table and JSON evidence are
+retained as the pre-fix assessment; they do not describe the current outcome of every probe.
+
+- Standing group writes check group policy assignments and reject PIM-managed or unknown governance in both profile and clone paths, including at the write boundary.
+- Failed relevant reads refuse apply; ARM and Graph paging is checked, failed active-group reads remain unknown, and expiring `Assigned` schedules are not converted into standing access.
+- Conditional RBAC and Azure eligibility copies are blocked; conditional target assignments cannot be silently replaced by unconditional profile grants.
+- Profile scopes are validated after alias resolution. Roles are resolved to canonical IDs and checked for access-administration permissions before planning and granting. Custom standing roles must be read-only.
+- Direct cloning requires `-TenantId`; the launcher supplies its bound configuration tenant. Graph/Azure contexts, subscription inventory, paging hosts, and ARM write scopes are checked against that public-cloud tenant.
+
+The focused suite includes legitimate Reader and ordinary-group controls, failure classes, equivalent
+role/scope forms, and full mocked clone runs. No live tenant validation has been performed.
+Ordinary groups may convey privilege outside PIM; these changes do not inventory all such access.
+The remaining P2 items (duration/policy safeguards, final audit outcomes, interactive defaults,
+and discovery completeness) still require work. The Graph scope-array defect and page-cap
+success defect were also addressed because the new guards depend on those paths.
+
 ## Privacy cleanup completed
 
 Reviewed all 12 supplied files: scripts, tenant profiles, tests, and runbook. Removed identifiable
@@ -28,9 +47,9 @@ Microsoft product names and public project/vendor names in this comparison are i
 - Disabled-target and same-source/target checks in cloning; existing-assignment checks.
 - Bounded group/directory eligibility defaults and separate consent families.
 
-## Open findings, in priority order
+## Original findings, in priority order
 
-Cleanup did **not** fix these access-engine issues. Offline probes validate local behavior;
+At the original review, cleanup did **not** fix these access-engine issues. Offline probes validate local behavior;
 no live tenant write or successful exploitation was attempted.
 
 | Priority | Finding and source | Evidence / recommended correction |

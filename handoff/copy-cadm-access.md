@@ -1,4 +1,4 @@
-# PIM access automation — operator runbook
+﻿# PIM access automation — operator runbook
 
 **Status:** read [the project review](project-review.md) before applying access. The current
 engine has confirmed safety gaps. This runbook describes its behavior, not a production approval.
@@ -10,9 +10,9 @@ start with `EXAMPLE_`. Copy it to a private tenant folder and supply your own ap
 management-group scope and group mappings. Real tenant folders are excluded by `.gitignore`.
 Keep a controlled private copy outside a public distribution.
 
-The launcher matches the current Azure CLI tenant to `tenant.psd1`. This is only a partial guard:
-it does not yet verify that Graph uses the same tenant or restrict every subscription to it.
-The direct clone entry point does not enforce this binding.
+The launcher matches the Azure CLI tenant to `tenant.psd1` and binds subsequent cloud calls to it.
+Direct cloning requires `-TenantId`. Azure and Graph must use the bound tenant in the public cloud;
+subscription discovery excludes other tenants, and grant scopes are checked again before writes.
 
 Prerequisites: PowerShell 5.1 or 7, Azure CLI, an existing authorized `az login`, and
 `Microsoft.Graph.Authentication`. Graph requires appropriate consent and caller permissions
@@ -26,7 +26,7 @@ From the project root:
 ```powershell
 .\scripts\cadm\Invoke-CadmAccess.ps1 -ListProfiles
 .\scripts\cadm\Invoke-CadmAccess.ps1 -Mode profile -ProfileName reader-only -TargetUser target-admin@example.com
-.\scripts\Copy-CadmAccess.ps1 -SourceUser source-admin@example.com -TargetUser target-admin@example.com
+.\scripts\Copy-CadmAccess.ps1 -TenantId '<your-tenant-guid>' -SourceUser source-admin@example.com -TargetUser target-admin@example.com
 ```
 
 These examples use synthetic accounts. The source and target must already exist; this tool
@@ -75,7 +75,8 @@ server will accept the eventual request.
 
 | Action | Meaning |
 |---|---|
-| `CREATE` | Candidate new grant; read failures can incorrectly produce this in some paths |
+| `CREATE` | Candidate new grant after successful required reads |
+| `BLOCKED-CONDITIONAL` | Conditional RBAC or Azure eligibility cannot be copied without a loss of restrictions |
 | `SKIP-EXISTS` | Matching assignment found; not a complete duration/condition comparison |
 | `SKIP-PIM-ACTIVATED` | Temporary source elevation. **Never grant this** as standing access |
 | `SKIP-PIM-MANAGED` | Source eligibility is handled through the PIM group plan |
@@ -86,8 +87,8 @@ server will accept the eventual request.
 | `INFO-VIA-GROUP` | RBAC conveyed by group membership rather than a direct user assignment |
 
 Check tenant, resolved source/target, scope, standing-versus-eligible status and scan coverage.
-`pimGroupsReadable` is diagnostic; the review identifies cases where it can be true despite an
-incomplete active-assignment read. A plan with unreadable or missing coverage does not prove parity.
+`pimGroupsReadable` requires complete active and eligible reads. A per-group fallback is partial
+coverage and blocks apply. A plan with unreadable or missing coverage does not prove parity.
 
 ## Apply behavior
 
@@ -106,8 +107,8 @@ Do not execute those exports blindly.
 ## Authentication and results
 
 `-UseDeviceCode` selects device-code login. `-ConnectGraph:$false` disables automatic sign-in;
-it does not provide an unattended identity. Existing sessions can be stale or belong to a different
-tenant. Current scope-request defects are documented in the review.
+it does not provide an unattended identity. Existing sessions are checked for the expected tenant/cloud before cloud data operations.
+Group governance checks additionally need `RoleManagementPolicy.Read.AzureADGroup` consent.
 
 `-SkipPimRoleCheck` on the direct clone script relaxes its role preflight, not Graph authorization.
 Use it only when the caller's actual authority is understood. The launcher does not expose every
@@ -130,3 +131,13 @@ pwsh -NoProfile -File tests/identity/Invoke-ReviewProbes.ps1
 
 The Python suite checks source text. Review probes demonstrate current gaps with synthetic data
 and mocked APIs. Neither establishes successful live provisioning.
+
+## P1 safeguards in the working version
+
+Standing group membership is refused for PIM-managed, role-assignable, synced, dynamic, or unverifiable groups, with a fresh check at grant time. This does not assess all Azure/application privileges conveyed by an ordinary group.
+
+Profile role aliases/names resolve to canonical role IDs. Access-administration permissions are refused for standing grants; custom standing roles must be read-only. Scope aliases are validated after resolution; encoded, root, ambiguous, and unsupported forms are refused.
+
+Conditional RBAC/resource-PIM assignments are blocked instead of copied without conditions. Expiring active assignments are not converted to standing assignments. Incomplete relevant discovery refuses apply, including throttle/network failures and failed pagination.
+
+Run `tests/identity/Invoke-P1SafetyTests.ps1` in both PowerShell editions for offline behavioral checks. Live grants remain unverified; the original review's remaining P2 issues still apply.
