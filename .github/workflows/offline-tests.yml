@@ -1,4 +1,4 @@
-name: Offline source checks and review probes
+﻿name: Offline source checks and review probes
 on:
   push:
   pull_request:
@@ -17,7 +17,7 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
       - name: Static source tests
         shell: pwsh
-        run: python -B -m pytest -q -p no:cacheprovider tests/identity
+        run: python -B -m pytest -q -p no:cacheprovider tests
       - name: Offline review probes in PowerShell 7 (known gaps, not safety certification)
         shell: pwsh
         run: ./tests/identity/Invoke-ReviewProbes.ps1
@@ -36,3 +36,10 @@ jobs:
       - name: Export profile regression tests in Windows PowerShell 5.1
         shell: powershell
         run: ./tests/identity/Invoke-ExportTests.ps1
+
+      - name: Workflow helper regressions in PowerShell 7
+        shell: pwsh
+        run: ./tests/Invoke-WorkflowTests.ps1
+      - name: Workflow helper regressions in Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/Invoke-WorkflowTests.ps1

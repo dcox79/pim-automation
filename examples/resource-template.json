@@ -1,0 +1,13 @@
+﻿{
+  "Name": "Workload Admin (JIT)",
+  "Description": "Contributor eligibility at a selected configured scope",
+  "Metadata": {
+    "SchemaVersion": "1", "Version": "1.0.0", "Owner": "Example",
+    "Purpose": "Manage approved workload resources", "Status": "Draft",
+    "ReviewDate": "2027-01-29", "DefaultScopeToken": "example-mg"
+  },
+  "Rbac": [], "GroupMemberships": [], "PimGroupEligibilities": [], "DirectoryRoleEligibilities": [],
+  "PimResourceEligibilities": [
+    {"RoleDefinitionId": "b24988ac-6180-42a0-ab88-20f7382dd24c", "Scope": "template-scope", "Duration": "P365D"}
+  ]
+}

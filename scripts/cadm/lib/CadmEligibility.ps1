@@ -121,8 +121,9 @@ function Invoke-CadmResourceEligibilityGrant {
     try {
         @{ properties = $properties } | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $bodyFile -Encoding utf8
         $url = "$ArmBase$($fresh.Scope)/providers/Microsoft.Authorization/roleEligibilityScheduleRequests/$([guid]::NewGuid())?api-version=$PimApi"
-        $null = Invoke-Rest -Url $url -Method put -BodyFile $bodyFile
+        $response = Invoke-Rest -Url $url -Method put -BodyFile $bodyFile
         if ($script:LastAzError) { throw $script:LastAzError }
+        return @{ RequestId = $url.Split('?')[0]; Response = $response }
     } finally {
         if (Test-Path -LiteralPath $bodyFile) { Remove-Item -LiteralPath $bodyFile -ErrorAction SilentlyContinue }
     }

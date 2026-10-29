@@ -1,10 +1,18 @@
-# Azure Owner (JIT) - the standard posture for a CADM account that administers Azure.
+﻿# Azure Owner (JIT) - the standard posture for a CADM account that administers Azure.
 #
 # EXAMPLE ONLY. Map the sample group to an approved group in your own tenant.
 # Intended posture: standing Reader, with Owner available through PIM activation. Deliberately NOT expressible here: standing Owner, User Access Administrator, root-scope
 # grants, or permanent membership of a PIM-managed group - the engine refuses all four no
 # matter what a profile says.
 @{
+    Metadata = @{
+        SchemaVersion = '1'
+        Version = '1.0.0'
+        Owner = 'Example Team'
+        Purpose = 'Synthetic example; review before use'
+        Status = 'Draft'
+        ReviewDate = '2027-01-29'
+    }
     Name        = 'Azure Owner (JIT)'
     Description = 'Standing Reader at the root MG; Owner only via PIM-for-Groups activation'
 

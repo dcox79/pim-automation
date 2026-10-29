@@ -1,4 +1,4 @@
-# SYNTHETIC EXAMPLE ONLY. Replace the zero GUID and sample group names before use.
+﻿# SYNTHETIC EXAMPLE ONLY. Replace the zero GUID and sample group names before use.
 # Keep real tenant bindings private; only this example belongs in a public distribution.
 # Example tenant bindings for the CADM access tooling.
 #
@@ -20,6 +20,7 @@
     # Scope shorthands profiles may use in their Rbac entries. Full '/subscriptions/...' or
     # '/providers/...' scopes are also accepted verbatim; '/' (root scope) never is.
     ScopeTokens = @{
+        'example-mg' = '/providers/Microsoft.Management/managementGroups/example'
         'root-mg' = '/providers/Microsoft.Management/managementGroups/00000000-0000-0000-0000-000000000000'
     }
 

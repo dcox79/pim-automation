@@ -1,3 +1,7 @@
+﻿# Guided template workflow
+
+Use [Start-CadmWorkflow.ps1](scripts/cadm/Start-CadmWorkflow.ps1) for guided building/review, exact-account preview/apply, outcome verification and scoped comparison reports. See the [workflow guide](WORKFLOW-README.md). Only synthetic configuration is included. The legacy entry point below remains available.
+
 # PIM Automation — templates and cloning
 
 PowerShell tools to preview and grant access from reusable tenant profiles or an existing user's assignments.

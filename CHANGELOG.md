@@ -1,6 +1,11 @@
-# Changelog
+﻿# Changelog
 
 ## Unreleased
+
+- Add a guided template workflow with exact-account confirmation, metadata review/version lifecycle, approved scope bindings, role selection and selected Azure-resource reference imports.
+- Add per-grant journals, Azure resource request receipts, independent provisioning readback and scoped comparison/expiry reports.
+- Add synthetic template metadata, a portable JSON example and mocked workflow regression tests for PowerShell 5.1 and 7.
+- Template review is operator attestation; no live provisioning or external approval integration is claimed.
 
 - Add read-only eligibility export to tenant-local PSD1 profiles, defaulting to Azure resources, with optional Graph group/Entra-role planes and recorded discovery coverage.
 - Preserve finite source expiry by default; allow an explicit fresh bounded duration. Refuse conditional, incomplete, conflicting, empty, or malformed exports and existing destinations.

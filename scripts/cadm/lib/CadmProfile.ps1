@@ -310,12 +310,13 @@ function Invoke-ProfileGrant {
     # carries literal values, no source lookup. Returns @{ Ok; Fail }.
     param([object[]]$Rows, [object]$Target, [string]$Justification, [string]$TicketNumber,
           [string]$TicketSystem, [string]$DefaultDuration = 'P365D')
-    $ok = 0; $fail = 0
+    $ok = 0; $fail = 0; $requests = @()
     foreach ($item in @($Rows | Where-Object { $_.Action -eq 'CREATE' })) {
         switch ($item.Plane) {
             'PIM-RES' {
                 try {
-                    Invoke-CadmResourceEligibilityGrant -Item $item -Target $Target -Justification $Justification -TicketNumber $TicketNumber -TicketSystem $TicketSystem -DefaultDuration $DefaultDuration
+                    $receipt = Invoke-CadmResourceEligibilityGrant -Item $item -Target $Target -Justification $Justification -TicketNumber $TicketNumber -TicketSystem $TicketSystem -DefaultDuration $DefaultDuration
+                    $requests += $receipt
                     Write-Host "  [OK]   PIM-RES $($item.Item): eligibility request submitted or already present"
                     $ok++
                 } catch { Write-Host "  [FAIL] PIM-RES $($item.Item): $($_.Exception.Message)"; $fail++ }
@@ -391,5 +392,5 @@ function Invoke-ProfileGrant {
             }
         }
     }
-    return @{ Ok = $ok; Fail = $fail }
+    return @{ Ok = $ok; Fail = $fail; Requests = $requests }
 }

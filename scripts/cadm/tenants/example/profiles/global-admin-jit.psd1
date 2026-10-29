@@ -1,4 +1,4 @@
-# Global Administrator (JIT) - the most privileged template in this repo. Read this before use.
+﻿# Global Administrator (JIT) - the most privileged template in this repo. Read this before use.
 #
 # Grants an ELIGIBILITY for Global Administrator via standard PIM (PIM for Entra roles), NOT
 # PIM for Groups and NOT a standing assignment. The holder is nothing until they activate; the
@@ -21,6 +21,14 @@
 # group plane is NOT automatically consented for this one; the launcher requests the extra
 # scopes only when a profile uses this plane.
 @{
+    Metadata = @{
+        SchemaVersion = '1'
+        Version = '1.0.0'
+        Owner = 'Example Team'
+        Purpose = 'Synthetic example; review before use'
+        Status = 'Draft'
+        ReviewDate = '2027-01-29'
+    }
     Name        = 'Global Administrator (JIT)'
     Description = 'Eligible for Global Administrator via standard PIM. No standing admin access.'
 

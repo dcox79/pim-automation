@@ -1,10 +1,18 @@
-# M365 workload admin (JIT) - per policy, every M365 admin EXCEPT Global Administrators works
+﻿# M365 workload admin (JIT) - per policy, every M365 admin EXCEPT Global Administrators works
 # through PIM for Groups. No standing admin access of any kind.
 #
 # EXAMPLE ONLY - EDIT THE LIST. These group names are placeholders, not an inventory.
 # Select the minimum workload groups needed. Review Global Administrator separately using
 # the directory-role profile and its activation policy.
 @{
+    Metadata = @{
+        SchemaVersion = '1'
+        Version = '1.0.0'
+        Owner = 'Example Team'
+        Purpose = 'Synthetic example; review before use'
+        Status = 'Draft'
+        ReviewDate = '2027-01-29'
+    }
     Name        = 'M365 Workload Admin (JIT)'
     Description = 'Standing Reader at the root MG; M365 admin roles only via PIM-for-Groups activation'
 
