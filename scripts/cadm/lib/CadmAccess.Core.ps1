@@ -14,7 +14,7 @@
 # Top-level statements here run in the caller too - including the $Interactive override and the
 # $MgScopeList computation - so an entry script that never defines those params simply gets the
 # defaults.
-$CadmCoreVersion = '1.5.1 (2026-09-29)'
+$CadmCoreVersion = '1.5.2 (2026-10-29)'
 
 $GraphBase = 'https://graph.microsoft.com/v1.0'
 $ArmBase   = 'https://management.azure.com'
@@ -651,11 +651,24 @@ function Get-Subscriptions {
     Assert-CadmAzContext
     $subs = Invoke-AzJson -AzArgs @('account', 'list', '--refresh', '--all', '-o', 'json')
     if ($script:LastAzError) { throw "could not refresh subscriptions ($script:LastAzError)" }
-    foreach ($sub in $subs) { if ($sub -and (-not (Get-CadmField $sub 'tenantId') -or -not (Get-CadmField $sub 'environmentName'))) { throw 'Subscription tenant/cloud metadata is missing.' } }
-    return @($subs | Where-Object { $_ -and (Get-CadmField $_ 'tenantId') -ieq $script:ExpectedTenantId -and
-        (Get-CadmField $_ 'environmentName') -eq 'AzureCloud' } | ForEach-Object {
-        [pscustomobject]@{ Id = $_.id; Name = $_.name; TenantId = $_.tenantId }
+    # account list uses cloudName; account show uses environmentName. Accept either
+    # explicit field, but never infer a missing cloud from the current session.
+    # Buffer the result so invalid metadata cannot return a partial inventory.
+    $verified = @(foreach ($sub in $subs) {
+        if (-not $sub) { continue }
+        $tenantId = [string](Get-CadmField $sub 'tenantId')
+        $cloud = [string](Get-CadmField $sub 'cloudName')
+        $environment = [string](Get-CadmField $sub 'environmentName')
+        if ($cloud -and $environment -and $cloud -ine $environment) {
+            throw 'Subscription cloudName/environmentName metadata conflicts.'
+        }
+        if (-not $cloud) { $cloud = $environment }
+        if (-not $tenantId -or -not $cloud) { throw 'Subscription tenant/cloud metadata is missing.' }
+        if ($tenantId -ieq $script:ExpectedTenantId -and $cloud -eq 'AzureCloud') {
+            [pscustomobject]@{ Id = $sub.id; Name = $sub.name; TenantId = $tenantId }
+        }
     })
+    return $verified
 }
 
 function Get-RoleDefGuid {

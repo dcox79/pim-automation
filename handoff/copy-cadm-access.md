@@ -33,7 +33,7 @@ These examples use synthetic accounts. The source and target must already exist;
 assigns access, not user accounts. Prefer explicit object IDs or exact UPNs. The current resolver
 can fall back to prefix matching, so verify the resolved target before proceeding.
 
-The launcher without arguments offers clone, interactive clone, profile apply and profile listing.
+The launcher without arguments offers clone, interactive clone, profile apply, profile listing, and eligibility export.
 Normal clone/profile modes preview by default. **Interactive mode implicitly enables apply** and
 includes root-scope and active-to-eligible candidates; `all` includes those candidates.
 
@@ -52,13 +52,13 @@ includes root-scope and active-to-eligible candidates; `all` includes those cand
 
 | Profile key | Current behavior |
 |---|---|
+| `PimResourceEligibilities` | Eligible Azure-resource roles by GUID and scope |
 | `Rbac` | Standing Azure RBAC |
 | `GroupMemberships` | Standing cloud group membership |
 | `PimGroupEligibilities` | Eligible group member/owner assignments |
 | `DirectoryRoleEligibilities` | Eligible Entra roles at tenant scope |
 
-Profiles do not currently support direct Azure-resource PIM eligibilities. Clone mode does
-not currently copy directory-role eligibilities. Group memberships may convey additional
+Profiles support direct Azure-resource eligibility. Clone mode does not currently copy directory-role eligibilities. Group memberships may convey additional
 privilege; a group name or `isAssignableToRole` flag does not fully describe that access.
 
 Example profiles: `reader-only`, `azure-owner-jit`, `m365-admin-jit`, `global-admin-jit`.
@@ -66,10 +66,59 @@ All require tenant-specific review. Global Administrator eligibility is especial
 approval, MFA/authentication context and activation duration come from the role's PIM policy.
 The current engine does not verify those safeguards before granting eligibility.
 
-Group and directory eligibility default to a bounded term. Policy-aware clamping exists, but
-explicit group durations and mirrored end dates bypass it. Azure-resource clones may retain
+Legacy group and directory eligibility default to a bounded term. Legacy explicit group durations and clone end dates can bypass policy clamping; new exported profiles validate their terms before applying. Azure-resource clones may retain
 permanent eligibility if the source has no expiry. Preview output is not a guarantee that the
 server will accept the eventual request.
+
+
+## Export a user's PIM eligibility
+
+Export is read-only in Azure and Graph. It writes a new data-only PSD1 profile into the
+bound tenant's private `profiles/` directory. It requires a source account and a new profile
+filename key, but no target account and no `-Apply`. Existing files are never overwritten.
+
+```powershell
+# Default: direct Azure-resource eligibility, without a Graph PowerShell connection.
+.\scripts\cadm\Invoke-CadmAccess.ps1 -Mode export -SourceUser source-admin@example.com -ProfileName peer-azure-jit -ConnectGraph:$false
+
+# Optional: include group and Entra-role eligibility once Graph read access is approved.
+.\scripts\cadm\Invoke-CadmAccess.ps1 -Mode export -SourceUser source-admin@example.com -ProfileName peer-all-jit -ExportPlanes AzureResource,Group,DirectoryRole
+
+# Review the generated file, then preview using the existing profile workflow.
+.\scripts\cadm\Invoke-CadmAccess.ps1 -Mode profile -ProfileName peer-azure-jit -TargetUser target-admin@example.com -ConnectGraph:$false
+```
+
+Azure discovery covers subscriptions visible to the signed-in operator and scopes returned through
+those subscriptions, including inherited management-group entries. Duplicate copies of the same
+eligibility are collapsed; differing schedules for the same role and scope require manual review.
+This is not an inventory of every effective permission. Group-based effective access, active
+assignments, and standing roles are not converted into direct eligibility. The exported `Export`
+metadata records tenant, source account, scan time, requested planes, and scanned subscription IDs.
+These files contain identity/access information and belong in private tenant folders.
+
+By default, finite source expiry dates are preserved as `EndDateTime` in UTC. Future start dates
+are retained. A source with permanent eligibility becomes a bounded assignment using the tenant's
+`DefaultEligibilityDuration`; it is never exported as permanent eligibility. To deliberately use a
+fresh term instead, pass `-EligibilityDuration P90D`. The original finite end date remains recorded
+as `SourceEndDateTime`. Profiles with a past expiry must be reviewed before reuse.
+
+Exports fail without saving a profile if any requested read fails, paging is incomplete, source
+data is malformed, or an Azure assignment has conditions. Empty selected coverage also produces
+no file. Graph exports are opt-in and request only read scopes; an existing session still needs
+the appropriate consent and caller permissions. Azure-only exports perform account lookup using
+Azure CLI's existing directory access but never call `Connect-MgGraph`.
+
+`PimResourceEligibilities` stores canonical role-definition GUIDs and exact ARM scopes. Group
+entries use `GroupId` and `AccessId`; directory entries use `RoleDefinitionId` and tenant scope `/`.
+Administrative-unit and app-scoped directory roles are refused. The profile engine resolves IDs,
+checks tenant/scope ownership, and checks eligibility expiration policies before applying the new
+resource plane or exported Graph entries. Explicit terms that exceed policy are rejected.
+Existing eligibilities are retained without renewal or expiry reconciliation. The tool still does
+not verify activation MFA/approval settings, guarantee transactional rollback, or verify final
+provisioning completion. A successful request submission is not proof of completed assignment.
+
+Use the updated launcher and libraries together. Exported profiles require profile engine 1.6.0
+or newer; older engines do not understand the new resource eligibility field.
 
 ## Read the plan
 

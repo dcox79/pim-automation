@@ -10,7 +10,9 @@
 # expiration-mirroring the clone path carries. A separate, smaller grant path means adding
 # profiles cannot regress the field-tested clone behaviour (its pinned tests).
 
-$CadmProfileVersion = '1.5.0 (2026-09-29)'
+$CadmProfileVersion = '1.6.0 (2026-10-29)'
+
+. (Join-Path $PSScriptRoot 'CadmEligibility.ps1')
 
 function Import-CadmTenant {
     # Match the CURRENT az login's tenantId against scripts/cadm/tenants/*/tenant.psd1 and return
@@ -73,6 +75,17 @@ function Assert-ProfileSafe {
     # on template authors to remember it. Throws on the first violation.
     param([object]$Profile, [hashtable]$Tenant)
     $name = $Profile.Name
+    if ((Get-CadmField $Profile.Data 'Export') -and
+        (Get-CadmField $Profile.Data.Export 'TenantId') -ine $Tenant.TenantId) {
+        throw 'Exported profile belongs to a different tenant.'
+    }
+    foreach ($e in (Get-ProfileEntries $Profile.Data.PimResourceEligibilities)) {
+        $null = Resolve-CadmScope -Scope ([string]$e.Scope) -Tenant $Tenant
+        $guid = [guid]::Empty
+        if (-not [guid]::TryParse([string]$e.RoleDefinitionId, [ref]$guid) -or $guid -eq [guid]::Empty) { throw 'Resource eligibility requires RoleDefinitionId as a GUID.' }
+        if (Test-CadmConditionalAssignment $e) { throw 'Conditional resource eligibility profiles are not supported.' }
+        Assert-CadmEligibilityTiming $e
+    }
     foreach ($r in (Get-ProfileEntries $Profile.Data.Rbac)) {
         $role = [string]$r.Role
         $scope = Resolve-CadmScope -Scope ([string]$r.Scope) -Tenant $Tenant
@@ -91,7 +104,8 @@ function Assert-ProfileSafe {
         if (-not $g.Group) { throw "profile '$name': a GroupMemberships entry has no Group." }
     }
     foreach ($e in (Get-ProfileEntries $Profile.Data.PimGroupEligibilities)) {
-        if (-not $e.Group) { throw "profile '$name': a PimGroupEligibilities entry has no Group." }
+        Assert-CadmEligibilityTiming $e
+        if (-not $e.Group -and -not $e.GroupId) { throw "profile '$name': a PimGroupEligibilities entry has no Group." }
         $acc = [string]$e.AccessId
         if ($acc -and $acc -notin @('member', 'owner')) {
             throw "profile '$name': PimGroupEligibilities AccessId must be 'member' or 'owner', got '$acc'."
@@ -102,7 +116,8 @@ function Assert-ProfileSafe {
     # nowhere else - as a JIT eligibility it is Microsoft's recommended pattern, whereas a
     # standing one is the single most dangerous grant in a tenant.
     foreach ($d in (Get-ProfileEntries $Profile.Data.DirectoryRoleEligibilities)) {
-        if (-not $d.Role) { throw "profile '$name': a DirectoryRoleEligibilities entry has no Role." }
+        Assert-CadmEligibilityTiming $d
+        if (-not $d.Role -and -not $d.RoleDefinitionId) { throw "profile '$name': a DirectoryRoleEligibilities entry has no Role." }
         $ds = [string]$d.DirectoryScopeId
         if ($ds -and $ds -ne '/') {
             throw "profile '$name': DirectoryRoleEligibilities DirectoryScopeId must be '/' (tenant) - administrative-unit scoping is not supported here."
@@ -183,6 +198,12 @@ function Resolve-ProfilePlan {
     param([object]$Profile, [object]$Target, [hashtable]$Tenant, [object[]]$Subs)
     $rows = [System.Collections.Generic.List[object]]::new()
 
+    foreach ($e in (Get-ProfileEntries $Profile.Data.PimResourceEligibilities)) {
+        $rows.Add((Resolve-CadmResourceEligibilityPlan -Entry $e -Target $Target -Tenant $Tenant))
+    }
+    $defaultDuration = [string](Get-CadmField $Tenant 'DefaultEligibilityDuration')
+    if (-not $defaultDuration) { $defaultDuration = 'P365D' }
+
     # --- RBAC (standing) ---
     # Queried per PROFILE SCOPE, not by sweeping subscriptions. A profile routinely names a
     # management-group scope (root-mg), and the sub sweep is both wasteful and easy to get wrong
@@ -233,7 +254,7 @@ function Resolve-ProfilePlan {
     $tgtEligKeys = @{}
     if ($needPim -and $tgtPimGrp.Ok) { foreach ($k in $tgtPimGrp.Map.Keys) { $tgtEligKeys[$k] = $true } }
     foreach ($e in (Get-ProfileEntries $Profile.Data.PimGroupEligibilities)) {
-        $g = Resolve-GroupByName -Name ([string]$e.Group)
+        $g = Resolve-CadmProfileGroup -Entry $e
         $acc = if ($e.AccessId) { [string]$e.AccessId } else { 'member' }
         $key = "$($g.id)|$acc"
         $action = if (-not $tgtPimGrp.Ok) { 'BLOCKED-PIM-UNKNOWN' }
@@ -242,8 +263,13 @@ function Resolve-ProfilePlan {
         $detail = if (-not $tgtPimGrp.Ok) { "PIM plane unreadable: $($tgtPimGrp.Error)" } else { 'eligibility' }
         # Duration is optional. Omitted, the grant negotiates against the group's PIM policy at
         # apply time (see Resolve-PimGroupExpiration); set it to pin an explicit ISO-8601 term.
-        $rows.Add([pscustomobject]@{ Plane='PIM-GRP'; Action=$action; Item="$($g.displayName) [$acc]"
-                                     Scope=$g.id; Detail=$detail; AccessId=$acc; Duration=[string]$e.Duration })
+        $row = [pscustomobject]@{ Plane='PIM-GRP'; Action=$action; Item="$($g.displayName) [$acc]"
+            Scope=$g.id; Detail=$detail; AccessId=$acc; Duration=[string]$e.Duration
+            StartDateTime=(Get-CadmField $e 'StartDateTime'); EndDateTime=(Get-CadmField $e 'EndDateTime'); ScheduleInfo=$null }
+        if ($action -eq 'CREATE' -and ((Get-CadmField $Profile.Data 'Export') -or $row.StartDateTime -or $row.EndDateTime)) {
+            $row.ScheduleInfo = Get-CadmProfileGraphSchedule -Entry $row -Plane 'PIM-GRP' -DefaultDuration $defaultDuration
+        }
+        $rows.Add($row)
     }
 
     # --- Directory-role (standard PIM) eligibilities ---
@@ -253,9 +279,10 @@ function Resolve-ProfilePlan {
     $needDir = (Get-ProfileEntries $Profile.Data.DirectoryRoleEligibilities).Count -gt 0
     $tgtDir = if ($needDir) { Get-DirRoleEligibilitiesFor -PrincipalId $Target.id } else { $null }
     foreach ($d in (Get-ProfileEntries $Profile.Data.DirectoryRoleEligibilities)) {
-        $roleName = [string]$d.Role
+        $roleName = if ($d.Role) { [string]$d.Role } else { [string]$d.RoleDefinitionId }
         $dscope = if ($d.DirectoryScopeId) { [string]$d.DirectoryScopeId } else { '/' }
-        $res = Resolve-DirectoryRoleId -Name $roleName
+        $res = Resolve-CadmProfileDirectoryRole -Entry $d
+        if (Get-CadmField $res 'Name') { $roleName = $res.Name }
         # Unreadable role catalogue and unreadable eligibilities are the same class of problem:
         # the plan cannot be trusted, so say so rather than guessing in either direction.
         $blocked = (-not $res.Ok) -or (-not $tgtDir.Ok)
@@ -266,8 +293,13 @@ function Resolve-ProfilePlan {
         $detail = if (-not $res.Ok) { "directory-role catalogue unreadable: $($res.Error)" }
                   elseif (-not $tgtDir.Ok) { "directory-role PIM plane unreadable: $($tgtDir.Error)" }
                   else { 'eligibility' }
-        $rows.Add([pscustomobject]@{ Plane='PIM-DIR'; Action=$action; Item=$roleName; Scope=$dscope
-                                     Detail=$detail; RoleDefinitionId=$res.Id; Duration=[string]$d.Duration })
+        $row = [pscustomobject]@{ Plane='PIM-DIR'; Action=$action; Item=$roleName; Scope=$dscope
+            Detail=$detail; RoleDefinitionId=$res.Id; Duration=[string]$d.Duration
+            StartDateTime=(Get-CadmField $d 'StartDateTime'); EndDateTime=(Get-CadmField $d 'EndDateTime'); ScheduleInfo=$null }
+        if ($action -eq 'CREATE' -and ((Get-CadmField $Profile.Data 'Export') -or $row.StartDateTime -or $row.EndDateTime)) {
+            $row.ScheduleInfo = Get-CadmProfileGraphSchedule -Entry $row -Plane 'PIM-DIR' -DefaultDuration $defaultDuration
+        }
+        $rows.Add($row)
     }
 
     return $rows
@@ -281,6 +313,13 @@ function Invoke-ProfileGrant {
     $ok = 0; $fail = 0
     foreach ($item in @($Rows | Where-Object { $_.Action -eq 'CREATE' })) {
         switch ($item.Plane) {
+            'PIM-RES' {
+                try {
+                    Invoke-CadmResourceEligibilityGrant -Item $item -Target $Target -Justification $Justification -TicketNumber $TicketNumber -TicketSystem $TicketSystem -DefaultDuration $DefaultDuration
+                    Write-Host "  [OK]   PIM-RES $($item.Item): eligibility request submitted or already present"
+                    $ok++
+                } catch { Write-Host "  [FAIL] PIM-RES $($item.Item): $($_.Exception.Message)"; $fail++ }
+            }
             'RBAC' {
                 $canonicalScope = Resolve-CadmScope -Scope $item.Scope -Tenant @{}
                 $roleId = Resolve-CadmStandingRole -Role $item.Detail -Scope $canonicalScope
@@ -311,6 +350,9 @@ function Invoke-ProfileGrant {
                     justification = $Justification
                     scheduleInfo  = @{ startDateTime = (Get-Date).ToUniversalTime().ToString('o'); expiration = $expiration }
                 }
+                if (Get-CadmField $item 'ScheduleInfo') {
+                    $body.scheduleInfo = Get-CadmProfileGraphSchedule -Entry $item -Plane $item.Plane -DefaultDuration $DefaultDuration
+                }
                 if ($TicketNumber -or $TicketSystem) { $body.ticketInfo = @{ ticketNumber = $TicketNumber; ticketSystem = $TicketSystem } }
                 $r = Invoke-MgJson -Method POST -Body $body `
                         -Uri "$GraphBase/identityGovernance/privilegedAccess/group/eligibilityScheduleRequests"
@@ -337,6 +379,9 @@ function Invoke-ProfileGrant {
                         startDateTime = (Get-Date).ToUniversalTime().ToString('o')
                         expiration    = @{ type = 'afterDuration'; duration = $dur }
                     }
+                }
+                if (Get-CadmField $item 'ScheduleInfo') {
+                    $body.scheduleInfo = Get-CadmProfileGraphSchedule -Entry $item -Plane $item.Plane -DefaultDuration $DefaultDuration
                 }
                 if ($TicketNumber -or $TicketSystem) { $body.ticketInfo = @{ ticketNumber = $TicketNumber; ticketSystem = $TicketSystem } }
                 $r = Invoke-MgJson -Method POST -Body $body `

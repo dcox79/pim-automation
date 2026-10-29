@@ -17,7 +17,7 @@
   Needs a current `az login` and the Microsoft.Graph.Authentication module
   (Install-Module Microsoft.Graph.Authentication -Scope CurrentUser - no admin needed).
 
-  THREE MODES
+  FOUR MODES
 
     1. Clone (automatic)     - read everything a source user holds, diff, grant the gap.
                                Delegates to Copy-CadmAccess.ps1.
@@ -25,6 +25,7 @@
                                grants only the ones you pick.
     3. Apply a profile       - grant a named template. No source user; the template is the
                                intent.
+    4. Export eligibility    - read a source user and save a tenant-local profile; no cloud writes.
 
   WHICH TO USE
 
@@ -68,7 +69,8 @@
   Scope is either a ScopeTokens key from tenant.psd1 or a full /subscriptions/... or
   /providers/... resource id.
 
-  FOUR PLANES a profile can grant:
+  FIVE PLANES a profile can grant:
+    PimResourceEligibilities   Azure-resource PIM eligibility (role-definition GUID + scope)
     Rbac                       standing Azure RBAC at a scope
     GroupMemberships           standing membership of a plain cloud group
     PimGroupEligibilities      PIM for GROUPS - eligible to activate a group's membership
@@ -79,8 +81,9 @@
   directory-role PIM (RoleEligibilitySchedule.ReadWrite.Directory vs *.AzureADGroup); the
   launcher requests the extra scopes only when a profile actually uses that plane.
 
-  Every eligibility is time-bound - never permanent - and clamped to the target's own PIM policy
-  ceiling. Set Duration on an entry to pin a term, or leave it for the tenant default.
+  Exported eligibilities preserve expiry by default. New Azure-resource profiles validate their
+  bounded term against the target policy before applying. Existing group/directory profiles keep
+  their legacy duration behavior; see the runbook for remaining limitations.
 
   WHAT A PROFILE MAY NOT SAY. The engine refuses these regardless of what the file contains, so
   the policy lives in one place instead of depending on template authors remembering it:
@@ -111,12 +114,15 @@
 
   Exit codes: 0 = success (or dry run), 1 = at least one grant failed, 2 = refused to apply.
 
-.PARAMETER Mode         clone | interactive | profile. Omit for the menu.
-.PARAMETER SourceUser   Template account for the clone modes. UPN, objectId, or UPN prefix.
+.PARAMETER Mode         clone | interactive | profile | export. Omit for the menu.
+.PARAMETER SourceUser   Source account for clone or export modes. UPN, objectId, or UPN prefix.
 .PARAMETER TargetUser   Account to grant. Same accepted forms.
-.PARAMETER ProfileName  Profile key for -Mode profile - the psd1 file's basename
+.PARAMETER ProfileName  Profile key for -Mode profile or export - the psd1 file's basename
                         (e.g. 'azure-owner-jit'). Named ProfileName because $Profile is an
                         automatic PowerShell variable and would collide.
+.PARAMETER ExportPlanes AzureResource (default), Group, DirectoryRole. Only selected planes are read.
+.PARAMETER EligibilityDuration Optional positive ISO-8601 duration for exported entries. Omit to
+                        preserve source expiry; permanent source eligibility uses the bounded tenant default.
 .PARAMETER ListProfiles Print the available profiles for the bound tenant and exit.
 .PARAMETER Apply        Perform the grants. Omit for a dry run (the default).
 .PARAMETER Force        With -Apply, skip the typed confirmation.
@@ -150,12 +156,15 @@
 #>
 
 param(
-    [ValidateSet('clone', 'interactive', 'profile')]
+    [ValidateSet('clone', 'interactive', 'profile', 'export')]
     [string]$Mode,
     [string]$SourceUser,
     [string]$TargetUser,
     [string]$ProfileName,
     [switch]$ListProfiles,
+    [ValidateSet('AzureResource', 'Group', 'DirectoryRole')]
+    [string[]]$ExportPlanes = @('AzureResource'),
+    [string]$EligibilityDuration,
     [switch]$Apply,
     [switch]$Force,
     [bool]$ConnectGraph = $true,
@@ -167,10 +176,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$LauncherVersion = '1.3.0 (2026-09-29)'
+$LauncherVersion = '1.4.0 (2026-10-29)'
+$Interactive = $false
+if ($Mode -eq 'export' -and ($Apply -or $Force -or $TargetUser)) { throw 'Export reads eligibility and writes a local profile only; do not supply Apply, Force, or TargetUser.' }
 
 . (Join-Path $PSScriptRoot 'lib\CadmAccess.Core.ps1')
 . (Join-Path $PSScriptRoot 'lib\CadmProfile.ps1')
+. (Join-Path $PSScriptRoot 'lib\CadmExport.ps1')
 
 Write-Host "Invoke-CadmAccess v$LauncherVersion (core v$CadmCoreVersion, profile v$CadmProfileVersion)"
 
@@ -205,6 +217,7 @@ if (-not $Mode) {
     Write-Host '  [2] Clone interactively                 (pick which rows to grant)'
     Write-Host '  [3] Apply a profile template            (recommended for a new account)'
     Write-Host '  [4] List profiles'
+    Write-Host '  [5] Export user PIM eligibility to a profile'
     Write-Host '  [q] Quit'
     Write-Host ''
     while (-not $Mode) {
@@ -220,10 +233,30 @@ if (-not $Mode) {
                 }
                 Write-Host ''
             }
+            '5' { $Mode = 'export' }
             'q' { Write-Host 'Nothing done.'; exit 0 }
-            default { Write-Host '  Enter 1, 2, 3, 4 or q.' }
+            default { Write-Host '  Enter 1, 2, 3, 4, 5 or q.' }
         }
     }
+}
+
+if ($Mode -eq 'export') {
+    if ($Apply -or $Force -or $TargetUser) { throw 'Export does not accept Apply, Force, or TargetUser.' }
+    if (-not $SourceUser -and [Environment]::UserInteractive) { $SourceUser = (Read-Host 'Source account UPN or object ID').Trim() }
+    if (-not $ProfileName -and [Environment]::UserInteractive) { $ProfileName = (Read-Host 'New profile filename key (for example azure-owner-jit)').Trim() }
+    if (-not $SourceUser -or -not $ProfileName) { throw 'Export requires -SourceUser and -ProfileName; no target account is needed.' }
+    $source = Resolve-CadmUser -Ref $SourceUser
+    Write-Host "  source: $($source.displayName) <$($source.userPrincipalName)> $($source.id)"
+    Write-Host "  export planes: $($ExportPlanes -join ', ')"
+    if ($ExportPlanes -contains 'Group' -or $ExportPlanes -contains 'DirectoryRole') {
+        Connect-CadmExportGraph -Planes $ExportPlanes
+    }
+    $exported = Export-CadmEligibilityProfile -Source $source -Tenant $tenant -ProfileName $ProfileName -Planes $ExportPlanes -Duration $EligibilityDuration
+    Write-Host "[OK] Profile written to $($exported.Path)"
+    Write-Host "  Azure-resource: $($exported.AzureResource); groups: $($exported.Group); directory roles: $($exported.DirectoryRole)"
+    Write-Host '  Selected planes only; Azure discovery covers accessible subscriptions and scopes returned through them.'
+    Write-Host '  No access granted. Review the profile, then preview it with -Mode profile and a target user.'
+    exit 0
 }
 
 if (-not $TargetUser) {
@@ -323,7 +356,9 @@ if ($usesDirRoles) {
     Write-Host "  note:   profile uses DIRECTORY-ROLE PIM; also requesting $($extra -join ', ')"
 }
 
-Connect-GraphIfNeeded -ProbePrincipalId $tgt.id
+$usesGroups = (Get-ProfileEntries $prof.Data.PimGroupEligibilities).Count -gt 0 -or
+              (Get-ProfileEntries $prof.Data.GroupMemberships).Count -gt 0
+if ($usesGroups -or $usesDirRoles) { Connect-GraphIfNeeded -ProbePrincipalId $tgt.id }
 $subs = Get-Subscriptions
 
 $rows = @(Resolve-ProfilePlan -Profile $prof -Target $tgt -Tenant $tenant -Subs $subs)

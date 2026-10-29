@@ -326,7 +326,7 @@ def test_launcher_validates_the_profile_before_touching_azure():
 
 def test_every_mode_is_reachable_without_the_menu():
     """The menu is a convenience, not the interface -- everything must automate."""
-    assert "[ValidateSet('clone', 'interactive', 'profile')]" in LAUNCHER
+    assert "[ValidateSet('clone', 'interactive', 'profile', 'export')]" in LAUNCHER
     assert "no -Mode given and this host is not interactive" in LAUNCHER_SRC
     assert "'-TargetUser is required.'" in LAUNCHER
 

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add read-only eligibility export to tenant-local PSD1 profiles, defaulting to Azure resources, with optional Graph group/Entra-role planes and recorded discovery coverage.
+- Preserve finite source expiry by default; allow an explicit fresh bounded duration. Refuse conditional, incomplete, conflicting, empty, or malformed exports and existing destinations.
+- Add Azure-resource eligibility profile preview/apply and stable group/directory IDs; validate exported expiration policies at planning and write time.
+- Add offline export/profile round-trip tests in PowerShell 5.1 and 7. No live grants were exercised.
+
+- Accept Azure CLI subscription-list `cloudName` metadata as well as `environmentName`; reject missing or conflicting metadata and preserve tenant/cloud filtering.
+
 - Reconnect older Graph sessions missing group policy-read permission; preserve sufficient read/read-write sessions and fail closed on denied policy reads.
 
 - Block standing membership in PIM-managed or unverifiable groups at planning and write time.

@@ -227,6 +227,40 @@ Test-Case 'Subscription inventory preserves only bound tenant and cloud' {
     $subs = @(Get-Subscriptions)
     Assert-True ($subs.Count -eq 1 -and $subs[0].Id -eq 'one' -and $subs[0].TenantId -eq $script:ExpectedTenantId) 'Foreign inventory retained.'
 }
+Test-Case 'Subscription inventory accepts CLI cloudName and filters foreign tenant/cloud' {
+    function Invoke-AzJson { return @(
+        [pscustomobject]@{ id = 'one'; name = 'One'; tenantId = $script:ExpectedTenantId; cloudName = 'AzureCloud' },
+        [pscustomobject]@{ id = 'two'; name = 'Two'; tenantId = '44444444-4444-4444-4444-444444444444'; cloudName = 'AzureCloud' },
+        [pscustomobject]@{ id = 'three'; name = 'Three'; tenantId = $script:ExpectedTenantId; cloudName = 'AzureUSGovernment' },
+        [pscustomobject]@{ id = 'four'; name = 'Four'; tenantId = $script:ExpectedTenantId; cloudName = 'AzureCloud'; environmentName = 'AzureCloud' }) }
+    $subs = @(Get-Subscriptions)
+    Assert-True ($subs.Count -eq 2 -and $subs[0].Id -eq 'one' -and $subs[1].Id -eq 'four') 'Valid cloudName inventory was rejected or foreign inventory retained.'
+    Assert-True (@($subs | Where-Object { $_.TenantId -ne $script:ExpectedTenantId }).Count -eq 0) 'Tenant metadata was lost.'
+}
+foreach ($invalidMetadata in @('missing-cloud', 'missing-tenant', 'conflicting-cloud', 'conflicting-environment')) {
+    Test-Case "Subscription inventory rejects $invalidMetadata" {
+        $script:badSubscription = @{ id = 'bad'; name = 'Bad'; tenantId = $script:ExpectedTenantId; cloudName = 'AzureCloud' }
+        switch ($invalidMetadata) {
+            'missing-cloud' { $script:badSubscription.Remove('cloudName') }
+            'missing-tenant' { $script:badSubscription.Remove('tenantId') }
+            'conflicting-cloud' { $script:badSubscription.cloudName = 'AzureUSGovernment'; $script:badSubscription.environmentName = 'AzureCloud' }
+            'conflicting-environment' { $script:badSubscription.environmentName = 'AzureUSGovernment' }
+        }
+        function Invoke-AzJson { return @(
+            @{ id = 'valid'; name = 'Valid'; tenantId = $script:ExpectedTenantId; cloudName = 'AzureCloud' },
+            $script:badSubscription) }
+        Assert-Throws { Get-Subscriptions }
+        Assert-True ($script:writes -eq 0) 'Invalid discovery attempted a write.'
+    }
+}
+Test-Case 'Subscription inventory refuses refresh failure' {
+    function Invoke-AzJson { $script:LastAzError = '429 TooManyRequests'; return @() }
+    Assert-Throws { Get-Subscriptions }
+}
+Test-Case 'Subscription inventory accepts a successful empty list' {
+    function Invoke-AzJson { return @() }
+    Assert-True (@(Get-Subscriptions).Count -eq 0) 'Successful empty inventory rejected.'
+}
 Test-Case 'Partial per-group active read is never complete' {
     function Get-PimCandidateGroupIds { @('first', 'second') }
     function Invoke-MgJsonAll { param($Uri)
