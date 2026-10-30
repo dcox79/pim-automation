@@ -1,4 +1,4 @@
-﻿name: Offline source checks and review probes
+name: Offline source checks and review probes
 on:
   push:
   pull_request:
@@ -43,3 +43,31 @@ jobs:
       - name: Workflow helper regressions in Windows PowerShell 5.1
         shell: powershell
         run: ./tests/Invoke-WorkflowTests.ps1
+
+      - name: Audit and coverage regressions in PowerShell 7
+        shell: pwsh
+        run: ./tests/Invoke-AuditCoverageTests.ps1
+      - name: Audit and coverage regressions in Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/Invoke-AuditCoverageTests.ps1
+
+      - name: Activation and backup regressions in PowerShell 7
+        shell: pwsh
+        run: ./tests/Invoke-ActivationBackupTests.ps1
+      - name: Activation and backup regressions in Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/Invoke-ActivationBackupTests.ps1
+
+      - name: TUI regressions in PowerShell 7
+        shell: pwsh
+        run: ./tests/Invoke-TuiTests.ps1
+      - name: TUI regressions in Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/Invoke-TuiTests.ps1
+
+      - name: Tenant setup regressions in PowerShell 7
+        shell: pwsh
+        run: ./tests/Invoke-SetupTests.ps1
+      - name: Tenant setup regressions in Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/Invoke-SetupTests.ps1

@@ -114,6 +114,8 @@
 
   Exit codes: 0 = success (or dry run), 1 = at least one grant failed, 2 = refused to apply.
 
+.PARAMETER Tui          Open the optional persistent terminal menu. Graph sign-in defaults off.
+.PARAMETER ConfirmTarget Require APPLY plus the exact target UPN at confirmation (used by the TUI).
 .PARAMETER Mode         clone | interactive | profile | export. Omit for the menu.
 .PARAMETER SourceUser   Source account for clone or export modes. UPN, objectId, or UPN prefix.
 .PARAMETER TargetUser   Account to grant. Same accepted forms.
@@ -123,6 +125,11 @@
 .PARAMETER ExportPlanes AzureResource (default), Group, DirectoryRole. Only selected planes are read.
 .PARAMETER EligibilityDuration Optional positive ISO-8601 duration for exported entries. Omit to
                         preserve source expiry; permanent source eligibility uses the bounded tenant default.
+.PARAMETER AdditionalScopes Extra ARM scopes or tenant scope tokens to read during export.
+.PARAMETER IncludeManagementGroups Discover and query accessible management groups during export.
+.PARAMETER IncludeGroupDerivedAccess Record group-derived access as evidence; never convert it to direct grants. Requires Graph read access.
+.PARAMETER VerificationAttempts Bounded post-apply read-back attempts (default 3).
+.PARAMETER VerificationDelaySeconds Delay between read-back attempts (default 5).
 .PARAMETER ListProfiles Print the available profiles for the bound tenant and exit.
 .PARAMETER Apply        Perform the grants. Omit for a dry run (the default).
 .PARAMETER Force        With -Apply, skip the typed confirmation.
@@ -156,6 +163,8 @@
 #>
 
 param(
+    [switch]$Tui,
+    [switch]$ConfirmTarget,
     [ValidateSet('clone', 'interactive', 'profile', 'export')]
     [string]$Mode,
     [string]$SourceUser,
@@ -165,6 +174,11 @@ param(
     [ValidateSet('AzureResource', 'Group', 'DirectoryRole')]
     [string[]]$ExportPlanes = @('AzureResource'),
     [string]$EligibilityDuration,
+    [string[]]$AdditionalScopes,
+    [switch]$IncludeManagementGroups,
+    [switch]$IncludeGroupDerivedAccess,
+    [ValidateRange(1,10)][int]$VerificationAttempts=3,
+    [ValidateRange(0,30)][int]$VerificationDelaySeconds=5,
     [switch]$Apply,
     [switch]$Force,
     [bool]$ConnectGraph = $true,
@@ -176,7 +190,17 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$LauncherVersion = '1.4.0 (2026-10-29)'
+if($Tui){
+    foreach($key in $PSBoundParameters.Keys){
+        if($key -notin @('Tui','OutDir','ConnectGraph')){throw '-Tui accepts only OutDir and ConnectGraph; select the operation in the menu.'}
+    }
+    $tuiParameters=@{ConnectGraph=$false}
+    if($OutDir){$tuiParameters.OutDir=$OutDir}
+    if($PSBoundParameters.ContainsKey('ConnectGraph')){$tuiParameters.ConnectGraph=$ConnectGraph}
+    & (Join-Path $PSScriptRoot 'Start-CadmTui.ps1') @tuiParameters
+    exit $LASTEXITCODE
+}
+$LauncherVersion = '1.7.0 (2026-10-29)'
 $Interactive = $false
 if ($Mode -eq 'export' -and ($Apply -or $Force -or $TargetUser)) { throw 'Export reads eligibility and writes a local profile only; do not supply Apply, Force, or TargetUser.' }
 
@@ -248,13 +272,15 @@ if ($Mode -eq 'export') {
     $source = Resolve-CadmUser -Ref $SourceUser
     Write-Host "  source: $($source.displayName) <$($source.userPrincipalName)> $($source.id)"
     Write-Host "  export planes: $($ExportPlanes -join ', ')"
-    if ($ExportPlanes -contains 'Group' -or $ExportPlanes -contains 'DirectoryRole') {
-        Connect-CadmExportGraph -Planes $ExportPlanes
+    if ($IncludeGroupDerivedAccess -or $ExportPlanes -contains 'Group' -or $ExportPlanes -contains 'DirectoryRole') {
+        Connect-CadmExportGraph -Planes $ExportPlanes -IncludeGroupDerivedAccess:$IncludeGroupDerivedAccess
     }
-    $exported = Export-CadmEligibilityProfile -Source $source -Tenant $tenant -ProfileName $ProfileName -Planes $ExportPlanes -Duration $EligibilityDuration
-    Write-Host "[OK] Profile written to $($exported.Path)"
+    $exported = Export-CadmEligibilityProfile -Source $source -Tenant $tenant -ProfileName $ProfileName -Planes $ExportPlanes -Duration $EligibilityDuration -AdditionalScopes $AdditionalScopes -IncludeManagementGroups:$IncludeManagementGroups -IncludeGroupDerivedAccess:$IncludeGroupDerivedAccess
+    if(-not $exported.Path){Write-Host "[OK] No direct eligibilities found. Group coverage report: $($exported.CoveragePath). No grant template created.";exit 0}
+    $backup=Backup-CadmProfileFiles -Tenant $tenant -ProfilePaths @($exported.Path) -Reason 'Profile export'
+    Write-Host "[OK] Profile written to $($exported.Path). Local backup: $($backup.Path)"
     Write-Host "  Azure-resource: $($exported.AzureResource); groups: $($exported.Group); directory roles: $($exported.DirectoryRole)"
-    Write-Host '  Selected planes only; Azure discovery covers accessible subscriptions and scopes returned through them.'
+    Write-Host '  Discovery scopes and optional group-derived evidence are recorded under Export in the profile.'
     Write-Host '  No access granted. Review the profile, then preview it with -Mode profile and a target user.'
     exit 0
 }
@@ -326,6 +352,8 @@ if (-not $prof) { throw "profile '$ProfileName' not found in $($tenant.ProfilesD
 # Validate BEFORE touching Azure. A profile that asks for something the engine refuses should
 # fail on the file, not halfway through a grant run.
 Assert-ProfileSafe -Profile $prof -Tenant $tenant
+$profileBackup=Backup-CadmProfileFiles -Tenant $tenant -ProfilePaths @($prof.Path) -Reason 'Profile preview/apply'
+Write-Host "Local profile backup: $($profileBackup.Path)"
 
 if (-not $Justification) { $Justification = "$($tenant.JustificationPrefix): $($prof.Name)" }
 
@@ -359,10 +387,11 @@ if ($usesDirRoles) {
 $usesGroups = (Get-ProfileEntries $prof.Data.PimGroupEligibilities).Count -gt 0 -or
               (Get-ProfileEntries $prof.Data.GroupMemberships).Count -gt 0
 if ($usesGroups -or $usesDirRoles) { Connect-GraphIfNeeded -ProbePrincipalId $tgt.id }
-$subs = Get-Subscriptions
+$subs = @() # Profile entries already contain exact scopes; each scope is tenant-validated.
 
 $rows = @(Resolve-ProfilePlan -Profile $prof -Target $tgt -Tenant $tenant -Subs $subs)
 
+Show-CadmActivationChecks -Rows $rows
 Write-Section 'PLAN'
 $rows | Sort-Object Plane, Action, Item |
     Format-Table -AutoSize @{L='Plane';E={$_.Plane}}, @{L='Action';E={$_.Action}},
@@ -372,106 +401,69 @@ $rows | Sort-Object Plane, Action, Item |
 Write-Host 'Summary:'
 foreach ($c in ($rows | Group-Object Action | Sort-Object Name)) { Write-Host ("  {0,-12} {1}" -f $c.Name, $c.Count) }
 
-# Audit JSON for every run, dry or not - the record of what a privileged tool was asked to do
-# matters as much as what it did.
+# Audit JSON is saved before confirmation and updated through completion.
 if (-not $OutDir) {
-    $OutDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) "PIM-Automation\cadm-clone\$(Get-Date -Format 'yyyy-MM-dd')"
+    $OutDir=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'PIM-Automation/cadm-profile'
 }
-if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
-$stamp = Get-Date -Format 'yyyyMMddHHmmss'
-$auditFile = Join-Path $OutDir "profile-$($prof.Key)-to-$(($tgt.userPrincipalName -split '@')[0])-$stamp.json"
-@{
-    launcherVersion = $LauncherVersion; coreVersion = $CadmCoreVersion; profileVersion = $CadmProfileVersion
-    tenant = @{ name = $tenant.Name; id = $tenant.TenantId; config = $tenant.Path }
-    profile = @{ key = $prof.Key; name = $prof.Name; file = $prof.Path }
-    target = @{ upn = $tgt.userPrincipalName; id = $tgt.id }
-    runAs = $acct.user.name; apply = [bool]$Apply; timestamp = (Get-Date).ToString('o')
-    plan = $rows
-} | ConvertTo-Json -Depth 8 | Set-Content -Path $auditFile -Encoding utf8
-
-$todo = @($rows | Where-Object { $_.Action -eq 'CREATE' })
-
-# An unreadable PIM plane means the plan was written from a blind spot. Report it loudly and
-# refuse to apply rather than granting the readable half and implying parity.
-$unknown = @($rows | Where-Object { $_.Action -eq 'BLOCKED-PIM-UNKNOWN' })
-if ($unknown.Count) {
-    Write-Host ''
-    # Name the actual planes. There are two independent ones with separate consent, so a message
-    # that always blames PIM-for-Groups sends the operator to fix the wrong scope.
-    $unknownPlanes = @($unknown | ForEach-Object { $_.Plane } | Sort-Object -Unique) -join ', '
-    Write-Host "  [WARN] $($unknown.Count) eligibility row(s) could not be checked - plane(s) $unknownPlanes"
-    Write-Host '         were not readable. That is an UNKNOWN, not a no. Fix the Graph session'
-    Write-Host '         (drop -ConnectGraph:$false, or Disconnect-MgGraph and re-run) before applying.'
-    foreach ($u in $unknown) { Write-Host "           - $($u.Plane) $($u.Item): $($u.Detail)" }
+$runId=[guid]::NewGuid().ToString()
+$runDir=Join-Path $OutDir $runId
+New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+$auditFile = Join-Path $runDir 'review.json'
+$audit=[ordered]@{
+    RunId=$runId;State='Preview';StartedUtc=[datetimeoffset]::UtcNow.ToString('o')
+    LauncherVersion=$LauncherVersion;CoreVersion=$CadmCoreVersion;ProfileVersion=$CadmProfileVersion
+    TenantId=$tenant.TenantId;Actor=$acct.user.name;Target=$tgt
+    Template=$prof.Key;TemplateHash=(Get-CadmFileHash $prof.Path)
+    TenantHash=(Get-CadmFileHash $tenant.Path);BackupPath=$profileBackup.Path
+    TemplateVersion=$prof.Data.Metadata.Version;Plan=$rows;ApplyRequested=[bool]$Apply
+    Coverage='Exact profile assignments only; existing eligibility expiry is retained.'
 }
-
+Write-CadmAudit $audit $auditFile
+$todo=@($rows | Where-Object Action -eq 'CREATE')
+$unknown=@($rows | Where-Object {$_.Action -notin @('CREATE','SKIP-EXISTS')})
 if (-not $Apply) {
-    Write-Host ''
-    Write-Host "[OK] plan written to $auditFile"
-    Write-Host ''
-    Write-Host "DRY RUN - nothing changed. $($todo.Count) grant(s) would be created."
-    Write-Host 'Re-run with -Apply to perform them.'
+    Write-Host "DRY RUN - nothing changed. $($todo.Count) grant(s) would be created. Audit: $auditFile"
+    if($unknown.Count){Write-Warning "$($unknown.Count) blocked rows; inspect the policy/discovery reasons. This preview cannot be applied.";exit 2}
     exit 0
 }
-if ($unknown.Count) {
-    Write-Host ''
-    Write-Host "REFUSING TO APPLY: $($unknown.Count) row(s) are BLOCKED-PIM-UNKNOWN. Applying now would"
-    Write-Host 'grant the readable planes while the eligibility state stays unverified.'
-    exit 2
-}
-if ($todo.Count -eq 0) { Write-Host ''; Write-Host 'Nothing to do - target already matches this profile.'; exit 0 }
-
-# Same refusal as the clone path: PIM-for-Groups writes need a write scope, and half-applying
-# leaves the target holding standing roles but none of the activate-on-demand access.
-$pimGrpTodo = @($todo | Where-Object { $_.Plane -eq 'PIM-GRP' })
-if ($pimGrpTodo.Count -and -not (Test-MgHasScope -Acceptable $MgWriteScopes)) {
-    Write-Host ''
-    Write-Host "REFUSING TO APPLY: $($pimGrpTodo.Count) PIM-for-Groups grant(s) are planned, but this"
-    Write-Host 'Graph session holds no write scope - they would all fail while the RBAC and group'
-    Write-Host 'grants succeeded, leaving a partial apply that looks finished.'
-    Write-Host ''
-    Write-Host ('  scopes held: ' + $(if ($script:MgScopesHeld.Count) { $script:MgScopesHeld -join ', ' } else { '(none)' }))
-    Write-Host ("  need one of: " + ($MgWriteScopes -join ', '))
-    exit 2
-}
-
-# Directory-role writes need their own scope. Same reasoning as the group-plane refusal: a
-# partial apply that grants the readable planes and silently drops the privileged one is worse
-# than not starting.
-$dirTodo = @($todo | Where-Object { $_.Plane -eq 'PIM-DIR' })
-if ($dirTodo.Count -and -not (Test-MgHasScope -Acceptable $MgDirWriteScopes)) {
-    Write-Host ''
-    Write-Host "REFUSING TO APPLY: $($dirTodo.Count) directory-role eligibility grant(s) are planned,"
-    Write-Host 'but this Graph session holds no directory-role write scope.'
-    Write-Host ''
-    Write-Host ('  scopes held: ' + $(if ($script:MgScopesHeld.Count) { $script:MgScopesHeld -join ', ' } else { '(none)' }))
-    Write-Host ("  need one of: " + ($MgDirWriteScopes -join ', '))
-    Write-Host ''
-    Write-Host '  This is a SEPARATE consent from the PIM-for-Groups scopes - a tenant consented'
-    Write-Host '  for groups is not consented for directory roles. Grant it to this account, then'
-    Write-Host '  Disconnect-MgGraph and re-run.'
-    exit 2
-}
-
-if (-not $Force) {
-    Write-Host ''
-    Write-Host "About to create $($todo.Count) grant(s) for $($tgt.userPrincipalName) from profile '$($prof.Name)'."
-    if ($dirTodo.Count) {
-        Write-Host ''
-        Write-Host "  ** $($dirTodo.Count) DIRECTORY-ROLE eligibility grant(s): $(($dirTodo.Item | Sort-Object -Unique) -join ', ')"
-        Write-Host '     These make the target ELIGIBLE to activate tenant-wide admin roles.'
-        Write-Host '     Activation gates (MFA, approval, duration) come from each role PIM policy -'
-        Write-Host '     confirm those are configured before relying on this as a control.'
+try {
+    if($unknown.Count){throw "$($unknown.Count) row(s) are BLOCKED-PIM-UNKNOWN or otherwise blocked."}
+    $pimGrpTodo=@($todo | Where-Object Plane -eq 'PIM-GRP')
+    $dirTodo=@($todo | Where-Object Plane -eq 'PIM-DIR')
+    if($pimGrpTodo.Count -and -not (Test-MgHasScope -Acceptable $MgWriteScopes)){
+        throw 'PIM-for-Groups writes require a Graph write scope; no assignments submitted.'
     }
-    if ((Read-Host 'Type APPLY to continue') -ne 'APPLY') { Write-Host 'Aborted.'; exit 0 }
+    if($dirTodo.Count -and -not (Test-MgHasScope -Acceptable $MgDirWriteScopes)){
+        throw 'Directory-role writes require a Graph directory-role write scope; no assignments submitted.'
+    }
+    if(-not $Force -and $todo.Count){
+        Write-Host "About to create $($todo.Count) grant(s) for $($tgt.userPrincipalName)."
+        if($dirTodo.Count){Write-Host 'These make the target ELIGIBLE to activate tenant-wide admin roles.'}
+        $confirmation=if($ConfirmTarget){Read-Host "Type APPLY $($tgt.userPrincipalName) to continue"}else{Read-Host 'Type APPLY to continue'}
+        $expected=if($ConfirmTarget){"APPLY $($tgt.userPrincipalName)"}else{'APPLY'}
+        if($confirmation -cne $expected){
+            $audit.State='Cancelled';Write-CadmAudit $audit $auditFile
+            Write-Host "Cancelled. No access granted. Audit: $auditFile";exit 0
+        }
+    }
+    if((Get-CadmFileHash $prof.Path) -ne $audit.TemplateHash -or
+       (Get-CadmFileHash $tenant.Path) -ne $audit.TenantHash){throw 'Configuration changed since review; preview again.'}
+    Assert-CadmAzContext
+    $freshTarget=Resolve-CadmUser -Ref $tgt.id
+    if(-not $freshTarget.accountEnabled -or $freshTarget.id -ine $tgt.id -or $freshTarget.userPrincipalName -ine $tgt.userPrincipalName){throw 'Target account changed since review.'}
+    $fresh=@(Resolve-ProfilePlan -Profile $prof -Target $freshTarget -Tenant $tenant -Subs $subs)
+    if((Get-CadmPlanFingerprint $fresh) -cne (Get-CadmPlanFingerprint $rows)){throw 'Access or policy changed since review; preview again.'}
+}catch{
+    $audit.State='Refused';$audit.Error=$_.Exception.Message;Write-CadmAudit $audit $auditFile
+    Write-Host "REFUSING TO APPLY: $($audit.Error) Audit: $auditFile";exit 2
 }
-
-$defaultDuration = if ($tenant.DefaultEligibilityDuration) { [string]$tenant.DefaultEligibilityDuration } else { 'P365D' }
-$res = Invoke-ProfileGrant -Rows $todo -Target $tgt -Justification $Justification `
-                           -TicketNumber $TicketNumber -TicketSystem $TicketSystem `
-                           -DefaultDuration $defaultDuration
-
-Write-Host ''
-Write-Host "Invoke-CadmAccess done: $($res.Ok) granted, $($res.Fail) failed. Audit: $auditFile"
-if ($res.Fail) { exit 1 }
+$audit.State='Approved';Write-CadmAudit $audit $auditFile
+$defaultDuration=if($tenant.DefaultEligibilityDuration){[string]$tenant.DefaultEligibilityDuration}else{'P365D'}
+# Invoke-ProfileGrant executes inside the shared audited runner, one assignment at a time.
+$outcome=Invoke-CadmAuditedProfileApply -Rows $fresh -Target $freshTarget -Justification $Justification -DefaultDuration $defaultDuration -TicketNumber $TicketNumber -TicketSystem $TicketSystem -RunDirectory $runDir -Context $audit -VerificationAttempts $VerificationAttempts -VerificationDelaySeconds $VerificationDelaySeconds
+$audit.State=$outcome.State;$audit.CompletedUtc=$outcome.CompletedUtc
+Write-CadmAudit $audit $auditFile
+$outcome.Verification | Format-Table Plane,Role,Status,Scope -Wrap | Out-Host
+Write-Host "Outcome: $($outcome.State). Audit: $runDir"
+if($outcome.State -ne 'Verified'){exit 1}
 exit 0

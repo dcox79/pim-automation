@@ -182,7 +182,7 @@ function Assert-CadmScopeTenant {
         $name = [uri]::EscapeDataString($Matches[1])
         $r = Invoke-Rest -Url "$ArmBase/providers/Microsoft.Management/managementGroups/$name`?api-version=2020-05-01"
         if (-not $r -or (Get-CadmField (Get-CadmField $r 'properties') 'tenantId') -ine $script:ExpectedTenantId) {
-            throw 'Management group is not verified in the bound tenant.'
+            throw "Management group is not verified in the bound tenant. $script:LastAzError"
         }
         return
     }
@@ -222,6 +222,7 @@ function Invoke-CadmRestAll {
         $all += @($values)
         $next = [string](Get-CadmField $r 'nextLink')
         if (-not $next) { $next = [string](Get-CadmField $r '@odata.nextLink') }
+        if (-not $next) { $next = [string](Get-CadmField $r '@nextLink') }
     }
     return $all
 }

@@ -106,7 +106,7 @@ def test_eligibility_expiration_is_negotiated_against_the_group_policy():
     expiration must come from the group's own policy so the tool complies with whatever each
     group is configured for."""
     grant = PROFILE[PROFILE.index("function Invoke-ProfileGrant"):]
-    assert "Resolve-PimGroupExpiration" in grant
+    assert "Get-CadmProfileGraphSchedule" in grant
     assert "expiration = @{ type = 'noExpiration' }" not in grant, "must not hardcode noExpiration"
 
 
@@ -174,12 +174,12 @@ def test_directory_role_grants_are_eligibility_requests_only():
     """roleEligibilityScheduleRequests makes someone eligible; roleAssignmentScheduleRequests
     would make the role ACTIVE and standing. Confusing the two on the GA path is the single
     worst mistake this file could make."""
-    grant = PROFILE[PROFILE.index("'PIM-DIR' {"):]
+    grant = PROFILE[PROFILE.index("function Invoke-ProfileGrant"): ]
     assert "roleEligibilityScheduleRequests" in grant
     assert "roleAssignmentScheduleRequests" not in grant, "must never create an ACTIVE directory role"
     assert "'adminAssign'" in grant
     # bounded, and clamped to the role's own policy ceiling
-    assert "Select-CadmDuration" in grant
+    assert "Get-CadmProfileGraphSchedule" in grant
     assert "noExpiration" not in grant
 
 
@@ -191,7 +191,7 @@ def test_directory_role_plane_has_its_own_consent_gate():
     assert "RoleEligibilitySchedule.ReadWrite.Directory" in CORE_SRC
     assert "$usesDirRoles" in LAUNCHER
     assert "Test-MgHasScope -Acceptable $MgDirWriteScopes" in LAUNCHER
-    assert "SEPARATE consent from the PIM-for-Groups scopes" in LAUNCHER_SRC
+    assert "Directory-role writes require a Graph directory-role write scope" in LAUNCHER_SRC
 
 
 def test_omitted_optional_keys_do_not_read_as_malformed_entries():
@@ -254,7 +254,7 @@ def test_directory_role_scope_is_tenant_root_only():
 def test_apply_confirmation_calls_out_directory_role_grants():
     """A tenant-wide admin eligibility must not be indistinguishable from a Reader grant in the
     confirmation prompt."""
-    assert "DIRECTORY-ROLE eligibility grant(s)" in LAUNCHER_SRC
+    assert "$dirTodo.Count" in LAUNCHER_SRC
     assert "ELIGIBLE to activate tenant-wide admin roles" in LAUNCHER_SRC
 
 
@@ -293,7 +293,7 @@ def test_profile_apply_is_idempotent():
     """Re-applying must be safe -- anything already in place reports SKIP-EXISTS, so a partial or
     failed run can simply be run again."""
     assert "SKIP-EXISTS" in PROFILE
-    assert "$_.Action -eq 'CREATE'" in PROFILE
+    assert "Where-Object Action -eq 'CREATE'" in PROFILE
 
 
 # --------------------------------------------------------------- launcher
@@ -321,7 +321,7 @@ def test_launcher_validates_the_profile_before_touching_azure():
     through a privileged grant run."""
     i_assert = LAUNCHER.index("Assert-ProfileSafe")
     assert i_assert < LAUNCHER.index("Resolve-ProfilePlan")
-    assert i_assert < LAUNCHER.index("Invoke-ProfileGrant")
+    assert i_assert < LAUNCHER.index("Invoke-CadmAuditedProfileApply")
 
 
 def test_every_mode_is_reachable_without_the_menu():

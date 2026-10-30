@@ -11,6 +11,7 @@ function Assert($Value){if(-not $Value){throw 'Assertion failed'}}
 function Refuses([scriptblock]$Test){$threw=$false;try{&$Test|Out-Null}catch{$threw=$true};Assert $threw}
 $temp=Join-Path ([IO.Path]::GetTempPath()) ('workflow-test-'+[guid]::NewGuid());New-Item -ItemType Directory $temp|Out-Null
 $tenant=@{TenantId='11111111-1111-1111-1111-111111111111';ScopeTokens=@{'example-mg'='/providers/Microsoft.Management/managementGroups/example'};ProfilesDir=$temp}
+$tenant.Path=Join-Path $temp 'tenant.psd1';[IO.File]::WriteAllText($tenant.Path,'@{}')
 $data=@{Name='Test';Description='Test';Metadata=@{SchemaVersion='1';Version='1.0.0';Owner='Team';Purpose='Operations';Status='Draft';ReviewDate=[datetime]::UtcNow.AddDays(90).ToString('yyyy-MM-dd')};PimResourceEligibilities=@(@{RoleDefinitionId='b24988ac-6180-42a0-ab88-20f7382dd24c';Scope='template-scope';Duration='P365D'})}
 Check 'Approved scope binds portable template' {Assert ((Set-WorkflowScope $tenant 'example-mg') -eq '/providers/Microsoft.Management/managementGroups/example')}
 Check 'Unconfigured scope refused' {Refuses {Set-WorkflowScope $tenant '/subscriptions/unapproved'}}
@@ -34,11 +35,12 @@ function Resolve-ProfilePlan {param($Profile,$Target,$Tenant,$Subs) return @($ro
 Check 'Missing assignment remains pending' {$v=@(Get-WorkflowVerification @($row) $target @{} $tenant @());Assert ($v[0].Status -eq 'Pending')}
 $record=@{id='assignment';properties=@{principalId=$target.id;scope=$scope;roleDefinitionId="/providers/Microsoft.Authorization/roleDefinitions/$role";status='Provisioned';startDateTime=[datetimeoffset]::UtcNow.AddHours(-1).ToString('o');endDateTime=[datetimeoffset]::UtcNow.AddDays(10).ToString('o')}}
 $script:records=@($record)
-Check 'Provisioned assignment and actual expiry verified' {$v=@(Get-WorkflowVerification @($row) $target @{} $tenant @());Assert ($v[0].Status -eq 'Provisioned');Assert ($v[0].Evidence[0].EndDateTime -eq $record.properties.endDateTime)}
+$row.ScheduleInfo=@{startDateTime=$record.properties.startDateTime;expiration=@{type='afterDateTime';endDateTime=$record.properties.endDateTime;duration='P365D'}}
+Check 'Provisioned assignment and actual expiry verified' {$v=@(Get-WorkflowVerification @($row) $target @{} $tenant @());Assert ($v[0].Status -eq 'Verified');Assert ($v[0].Evidence[0].EndDateTime -eq $record.properties.endDateTime)}
 Check 'Expiring eligibility classified' {$v=@(Get-WorkflowResourceReport @($row) $target);Assert ($v[0].Classification -eq 'Expiring')}
 Check 'Pending Azure status is not success' {$record.properties.status='PendingApproval';$v=@(Get-WorkflowVerification @($row) $target @{} $tenant @());Assert ($v[0].Status -eq 'Pending');$record.properties.status='Provisioned'}
-Check 'Expired eligibility is not verified' {$saved=$record.properties.endDateTime;$record.properties.endDateTime='2020-01-01T00:00:00Z';$v=@(Get-WorkflowVerification @($row) $target @{} $tenant @());Assert ($v[0].Status -ne 'Provisioned');$record.properties.endDateTime=$saved}
-Check 'Conditional eligibility is not verified' {$record.properties.condition='restriction';$v=@(Get-WorkflowVerification @($row) $target @{} $tenant @());Assert ($v[0].Status -ne 'Provisioned');$record.properties.Remove('condition')}
+Check 'Expired eligibility is not verified' {$saved=$record.properties.endDateTime;$record.properties.endDateTime='2020-01-01T00:00:00Z';$v=@(Get-WorkflowVerification @($row) $target @{} $tenant @());Assert ($v[0].Status -ne 'Verified');$record.properties.endDateTime=$saved}
+Check 'Conditional eligibility is not verified' {$record.properties.condition='restriction';$v=@(Get-WorkflowVerification @($row) $target @{} $tenant @());Assert ($v[0].Status -ne 'Verified');$record.properties.Remove('condition')}
 Check 'Read error stays Unknown' {$script:readFail=$true;$v=@(Get-WorkflowVerification @($row) $target @{} $tenant @());Assert ($v[0].Status -eq 'Unknown');$script:readFail=$false}
 Check 'Extra direct eligibility reported without removal' {$record.properties.roleDefinitionId='/providers/Microsoft.Authorization/roleDefinitions/8e3af657-a8ff-443c-a75c-2fe8c4bcb635';$v=@(Get-WorkflowResourceReport @($row) $target);Assert ($v[0].Classification -eq 'Extra')}
 Check 'Foreign principals/scopes excluded' {$record.properties.principalId='foreign';Assert (@(Get-WorkflowResourceReport @($row) $target).Count -eq 0)}

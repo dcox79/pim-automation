@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 # Offline behavioral regressions. Every cloud transport is mocked; no credentials needed.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
@@ -80,7 +80,8 @@ Test-Case 'PIM group rejected during profile planning' {
 Test-Case 'Changed group governance blocks stale profile plan' {
     $row = @{ Plane = 'GROUP'; Action = 'CREATE'; Item = 'Example'; Scope = 'group' }
     $script:groupMode = 'unknown'
-    Assert-Throws { Invoke-ProfileGrant -Rows @($row) -Target $target }
+    $receipt=Invoke-ProfileGrant -Rows @($row) -Target $target
+    Assert-True ($receipt.Fail -eq 1 -and $receipt.Entries[0].Error) 'Refusal must be recorded in the per-assignment receipt.'
     Assert-True ($script:writes -eq 0) 'Stale plan wrote access.'
 }
 Test-Case 'Successful empty profile RBAC read permits CREATE' {
@@ -144,7 +145,8 @@ Test-Case 'Owner GUID and full ID blocked' {
 }
 Test-Case 'Resolved privileged role blocked at grant' {
     $script:role.id = '/providers/Microsoft.Authorization/roleDefinitions/8e3af657-a8ff-443c-a75c-2fe8c4bcb635'
-    Assert-Throws { Invoke-ProfileGrant -Rows @(@{ Plane = 'RBAC'; Action = 'CREATE'; Detail = 'renamed'; Scope = $script:scope }) -Target $target }
+    $receipt=Invoke-ProfileGrant -Rows @(@{ Plane = 'RBAC'; Action = 'CREATE'; Detail = 'renamed'; Scope = $script:scope }) -Target $target
+    Assert-True ($receipt.Fail -eq 1 -and $receipt.Entries[0].Error) 'Privileged role refusal must be recorded.'
     Assert-True ($script:writes -eq 0) 'Privileged role reached sink.'
 }
 foreach ($badScope in @('/', ' /', '/subscriptions/22222222-2222-2222-2222-222222222222/../', '/subscriptions/22222222-2222-2222-2222-222222222222%2f', '/subscriptions/22222222-2222-2222-2222-222222222222?x=1', '/providers/Microsoft.Management/managementGroups/example/')) {

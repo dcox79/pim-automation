@@ -1,4 +1,4 @@
-﻿# Guided template workflow 1.0
+# Guided template workflow 1.0
 
 Start here in PowerShell 7 (or Windows PowerShell 5.1):
 
@@ -63,17 +63,21 @@ policy-bounded terms, and plan. After typed confirmation, identity/configuration
 are checked again; changed plans are refused. This is an in-process reviewed plan, not a signed,
 externally approved plan or replayable approval token.
 
-`submissions.json` journals each grant and available request receipts. `outcome.json` records partial
-failures and independent readback, with up to three attempts by default. Resource PIM rows are only
-Provisioned when Azure returns a nonconditional Provisioned eligibility schedule instance with valid
-current/future timing. Assignment IDs and actual dates are recorded. Group/directory/standing rows
-are labelled Observed when existing profile discovery sees them; these readers do not expose the
-same provisioning-status evidence. Pending/Unknown is a non-success exit, not permission to resubmit
-blindly. First inspect Azure requests and compare again. Existing eligibilities are never renewed.
+Both profile entry points now share the same per-assignment journal and verification engine.
+submissions.json is flushed before and after each write, including failures and available request
+IDs. outcome.json records independent read-back evidence. Verification checks exact identity,
+role or membership type, scope, and the dates actually submitted. Existing assignments are
+Retained; new assignments are Verified only when the required evidence matches. Pending, Unknown,
+and Mismatch are non-success outcomes, not permission to resubmit blindly.
 
-The new workflow uses the existing grant engine, with additive resource-request receipt capture.
-The legacy launcher remains for compatibility and does not enforce the new metadata lifecycle or
-produce the new workflow outcome journal. Use Start-CadmWorkflow for these improvements.
+The guided workflow additionally requires reviewed template metadata. The compatibility
+Invoke-CadmAccess.ps1 -Mode profile command now has the same final-outcome audit and read-back
+checks, while retaining its existing metadata and confirmation contract.
+
+See [verification and broader coverage](handoff/profile-verification-and-coverage.md) for the
+full audit schema, coverage flags, Graph permissions, and limitations. The Import action accepts
+ExportPlanes, AdditionalScopes, IncludeManagementGroups, and IncludeGroupDerivedAccess;
+operators still select individual direct eligibility entries before saving a template.
 
 ## Compare and renewal review
 
@@ -85,7 +89,8 @@ produce the new workflow outcome journal. Use Start-CadmWorkflow for these impro
 expired and extra direct resource eligibilities at the template's exact scopes. Extra means outside
 this template, not necessarily inappropriate. Group-based access, unrelated scopes, active/standing
 access outside expected entries, and all effective permissions are not inventoried. No automatic
-removal, renewal, scheduling or rollback is performed. Activation MFA/approval policy is not verified.
+removal, renewal, scheduling or rollback is performed. Azure-resource activation policies are checked
+in report-only mode unless local requirements are explicitly configured; group/directory activation policy and Conditional Access behavior are not evaluated.
 Concurrent operators must coordinate; there is no distributed locking or transaction across grants.
 
 ## Offline validation

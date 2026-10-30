@@ -1,6 +1,23 @@
-﻿# Changelog
+# Changelog
 
 ## Unreleased
+
+- Explain each terminal menu action and its cloud/local effects; add first-time local tenant setup with explicit scope selection, optional Reader starter template, cancellation, duplicate protection and unchanged Azure activation policies.
+
+- Add optional persistent numbered terminal menu (-Tui): account search, profile preview/apply, eligibility export, offline browsing/backups and recent reports. Keep existing CLI commands, Graph sign-in off by default, and require exact target confirmation after preview.
+
+- Correct activation inspection to report-only by default; remove assistant-added Odyssey requirements. Readable settings are Observed. Additional MFA, approval, or duration restrictions require explicit configuration.
+
+- Add ARM-only activation policy checks for Azure-resource profiles: explicit MFA, approval with configured primary approvers, expiration, and an optional activation-duration ceiling. These restrictions are opt-in; unreadable checks remain blocked. Recheck before grants.
+- Add automatic and manual byte-preserving local tenant/profile snapshots with verified hashes and manifests; keep snapshots git-ignored.
+- Remove the unused subscription sweep from exact-scope profile workflows while retaining per-scope tenant validation.
+- Exercise live read-only preview behavior; the local tenant ARM check was blocked by certificate-chain validation and correctly recorded Unknown without writes.
+
+- Generate export display names and descriptions from actual roles, scopes, and expiry terms.
+- Add opt-in direct management-group discovery, explicit additional ARM scopes, and group-derived access evidence without converting indirect access into direct grants.
+- Share exact-identity/scope/date verification and durable per-assignment outcome journals across both profile commands; retain request receipts, failures, observed assignment IDs, and actual dates.
+- Reject mismatched or unverified outcomes; retry only reads. Preserve existing eligibility without silent renewal.
+- Support broader guided imports and evidence-only reports, and add offline coverage/audit/launcher regressions for PowerShell 5.1 and 7.
 
 - Add a guided template workflow with exact-account confirmation, metadata review/version lifecycle, approved scope bindings, role selection and selected Azure-resource reference imports.
 - Add per-grant journals, Azure resource request receipts, independent provisioning readback and scoped comparison/expiry reports.

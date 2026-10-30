@@ -10,9 +10,12 @@
 # expiration-mirroring the clone path carries. A separate, smaller grant path means adding
 # profiles cannot regress the field-tested clone behaviour (its pinned tests).
 
-$CadmProfileVersion = '1.6.0 (2026-10-29)'
+$CadmProfileVersion = '1.7.1 (2026-10-29)'
 
 . (Join-Path $PSScriptRoot 'CadmEligibility.ps1')
+. (Join-Path $PSScriptRoot 'CadmAudit.ps1')
+. (Join-Path $PSScriptRoot 'CadmActivation.ps1')
+. (Join-Path $PSScriptRoot 'CadmBackup.ps1')
 
 function Import-CadmTenant {
     # Match the CURRENT az login's tenantId against scripts/cadm/tenants/*/tenant.psd1 and return
@@ -306,91 +309,62 @@ function Resolve-ProfilePlan {
 }
 
 function Invoke-ProfileGrant {
-    # Grant the CREATE rows of a resolved profile plan. Declarative and idempotent - every row
-    # carries literal values, no source lookup. Returns @{ Ok; Fail }.
+    # Submission receipts are separate from read-back verification.
     param([object[]]$Rows, [object]$Target, [string]$Justification, [string]$TicketNumber,
           [string]$TicketSystem, [string]$DefaultDuration = 'P365D')
-    $ok = 0; $fail = 0; $requests = @()
-    foreach ($item in @($Rows | Where-Object { $_.Action -eq 'CREATE' })) {
-        switch ($item.Plane) {
-            'PIM-RES' {
-                try {
-                    $receipt = Invoke-CadmResourceEligibilityGrant -Item $item -Target $Target -Justification $Justification -TicketNumber $TicketNumber -TicketSystem $TicketSystem -DefaultDuration $DefaultDuration
-                    $requests += $receipt
-                    Write-Host "  [OK]   PIM-RES $($item.Item): eligibility request submitted or already present"
-                    $ok++
-                } catch { Write-Host "  [FAIL] PIM-RES $($item.Item): $($_.Exception.Message)"; $fail++ }
-            }
-            'RBAC' {
-                $canonicalScope = Resolve-CadmScope -Scope $item.Scope -Tenant @{}
-                $roleId = Resolve-CadmStandingRole -Role $item.Detail -Scope $canonicalScope
-                $null = Invoke-AzJson -AzArgs @('role', 'assignment', 'create',
-                    '--assignee-object-id', $Target.id, '--assignee-principal-type', 'User',
-                    '--role', $roleId, '--scope', $canonicalScope, '-o', 'json')
-                if ($script:LastAzError) { Write-Host "  [FAIL] RBAC    $($item.Item) @ $($item.Scope): $script:LastAzError"; $fail++ }
-                else { Write-Host "  [OK]   RBAC    $($item.Item) @ $($item.Scope)"; $ok++ }
-            }
-            'GROUP' {
-                Add-CadmStandingGroupMember -GroupId $item.Scope -PrincipalId $Target.id
-                if ($script:LastAzError) { Write-Host "  [FAIL] GROUP   $($item.Item): $script:LastAzError"; $fail++ }
-                else { Write-Host "  [OK]   GROUP   $($item.Item)"; $ok++ }
-            }
-            'PIM-GRP' {
-                # Eligibility, never standing access. The expiration is negotiated against the
-                # group's own PIM policy rather than hardcoded: a policy that forbids permanent
-                # eligibility rejects noExpiration outright with
-                #   ExpirationRule - The policy does not allow permanent assignment
-                # which is a policy conflict rather than an authentication failure.
-                $expiration = Resolve-PimGroupExpiration -GroupId $item.Scope -AccessId $item.AccessId `
-                                                         -Duration $item.Duration -DefaultDuration $DefaultDuration
-                $body = @{
-                    accessId      = $item.AccessId
-                    principalId   = $Target.id
-                    groupId       = $item.Scope
-                    action        = 'adminAssign'
-                    justification = $Justification
-                    scheduleInfo  = @{ startDateTime = (Get-Date).ToUniversalTime().ToString('o'); expiration = $expiration }
+    $ok=0;$fail=0;$requests=@();$entries=@()
+    foreach($item in @($Rows | Where-Object Action -eq 'CREATE')){
+        $entry=[ordered]@{Plane=$item.Plane;Role=$item.Item;Scope=$item.Scope;State='Submitting';RequestId=$null;AssignmentId=$null;ScheduleInfo=$null;Error=$null}
+        try {
+            switch($item.Plane){
+                'PIM-RES' {
+                    $receipt=Invoke-CadmResourceEligibilityGrant -Item $item -Target $Target -Justification $Justification -TicketNumber $TicketNumber -TicketSystem $TicketSystem -DefaultDuration $DefaultDuration
+                    if($receipt){$requests+=,$receipt;$entry.RequestId=$receipt.RequestId;$entry.ScheduleInfo=$receipt.ScheduleInfo}
+                    if($receipt.State -eq 'Retained'){$entry.State='Retained'}
                 }
-                if (Get-CadmField $item 'ScheduleInfo') {
-                    $body.scheduleInfo = Get-CadmProfileGraphSchedule -Entry $item -Plane $item.Plane -DefaultDuration $DefaultDuration
+                'RBAC' {
+                    $scope=Resolve-CadmScope -Scope $item.Scope -Tenant @{}
+                    $role=Resolve-CadmStandingRole -Role $item.Detail -Scope $scope
+                    $response=Invoke-AzJson -AzArgs @('role','assignment','create','--assignee-object-id',$Target.id,'--assignee-principal-type','User','--role',$role,'--scope',$scope,'-o','json')
+                    if($script:LastAzError){throw $script:LastAzError}
+                    $entry.AssignmentId=Get-CadmField $response 'id'
+                    $requests+=@{AssignmentId=$entry.AssignmentId;Response=$response}
                 }
-                if ($TicketNumber -or $TicketSystem) { $body.ticketInfo = @{ ticketNumber = $TicketNumber; ticketSystem = $TicketSystem } }
-                $r = Invoke-MgJson -Method POST -Body $body `
-                        -Uri "$GraphBase/identityGovernance/privilegedAccess/group/eligibilityScheduleRequests"
-                if ($r.Ok) { Write-Host "  [OK]   PIM-GRP $($item.Item)"; $ok++ }
-                else { Write-Host "  [FAIL] PIM-GRP $($item.Item): $($r.Error)"; $fail++ }
-            }
-            'PIM-DIR' {
-                # Standard PIM: an ELIGIBILITY for a directory role, tenant-scoped. adminAssign
-                # against roleEligibilityScheduleRequests - NEVER roleAssignmentScheduleRequests,
-                # which would make the role active and standing.
-                #
-                # Activation gates (MFA, justification, approval, max duration) belong to the
-                # role's own PIM policy and are not set here: they apply to everyone eligible for
-                # the role, so they are a tenant decision rather than a per-user one.
-                $dur = Select-CadmDuration -MaxDuration (Get-DirRoleExpirationRule -RoleDefinitionId $item.RoleDefinitionId).MaxDuration `
-                                           -DefaultDuration $(if ($item.Duration) { $item.Duration } else { $DefaultDuration })
-                $body = @{
-                    action           = 'adminAssign'
-                    roleDefinitionId = $item.RoleDefinitionId
-                    principalId      = $Target.id
-                    directoryScopeId = $item.Scope
-                    justification    = $Justification
-                    scheduleInfo     = @{
-                        startDateTime = (Get-Date).ToUniversalTime().ToString('o')
-                        expiration    = @{ type = 'afterDuration'; duration = $dur }
+                'GROUP' {
+                    Add-CadmStandingGroupMember -GroupId $item.Scope -PrincipalId $Target.id
+                    if($script:LastAzError){throw $script:LastAzError}
+                    # This API has no assignment/request ID; record the exact membership instead.
+                    $requests+=@{GroupId=$item.Scope;MemberId=$Target.id;RequestId=$null}
+                }
+                {$_ -in @('PIM-GRP','PIM-DIR')} {
+                    $schedule=Get-CadmProfileGraphSchedule -Entry $item -Plane $item.Plane -DefaultDuration $DefaultDuration
+                    $entry.ScheduleInfo=$schedule
+                    $body=@{action='adminAssign';principalId=$Target.id;justification=$Justification;scheduleInfo=$schedule}
+                    if($item.Plane -eq 'PIM-GRP'){
+                        $body.accessId=$item.AccessId;$body.groupId=$item.Scope
+                        $url="$GraphBase/identityGovernance/privilegedAccess/group/eligibilityScheduleRequests"
+                    }else{
+                        $body.roleDefinitionId=$item.RoleDefinitionId;$body.directoryScopeId=$item.Scope
+                        $url="$GraphBase/roleManagement/directory/roleEligibilityScheduleRequests"
                     }
+                    if($TicketNumber -or $TicketSystem){$body.ticketInfo=@{ticketNumber=$TicketNumber;ticketSystem=$TicketSystem}}
+                    $r=Invoke-MgJson -Method POST -Uri $url -Body $body
+                    if(-not $r.Ok){throw $r.Error}
+                    $response=@($r.Value | Select-Object -First 1)
+                    if($response.Count){$entry.RequestId=Get-CadmField $response[0] 'id'}
+                    $requests+=@{RequestId=$entry.RequestId;Response=$r.Value;ScheduleInfo=$schedule}
                 }
-                if (Get-CadmField $item 'ScheduleInfo') {
-                    $body.scheduleInfo = Get-CadmProfileGraphSchedule -Entry $item -Plane $item.Plane -DefaultDuration $DefaultDuration
-                }
-                if ($TicketNumber -or $TicketSystem) { $body.ticketInfo = @{ ticketNumber = $TicketNumber; ticketSystem = $TicketSystem } }
-                $r = Invoke-MgJson -Method POST -Body $body `
-                        -Uri "$GraphBase/roleManagement/directory/roleEligibilityScheduleRequests"
-                if ($r.Ok) { Write-Host "  [OK]   PIM-DIR $($item.Item) (eligible, $dur)"; $ok++ }
-                else { Write-Host "  [FAIL] PIM-DIR $($item.Item): $($r.Error)"; $fail++ }
+                default {throw "Unsupported grant plane: $($item.Plane)"}
             }
+            if($entry.State -ne 'Retained'){$entry.State='Submitted'}
+            $ok++;Write-Host "  [OK] $($item.Plane) $($item.Item): $($entry.State)"
+        }catch{
+            $entry.State='Failed';$entry.Error=$_.Exception.Message
+            if($_.Exception.Data.Contains('RequestId')){$entry.RequestId=$_.Exception.Data['RequestId']}
+            if($_.Exception.Data.Contains('ScheduleInfo')){$entry.ScheduleInfo=$_.Exception.Data['ScheduleInfo']}
+            $fail++;Write-Host "  [FAIL] $($item.Plane) $($item.Item): $($entry.Error)"
         }
+        $entries+=,$entry
     }
-    return @{ Ok = $ok; Fail = $fail; Requests = $requests }
+    return @{Ok=$ok;Fail=$fail;Requests=$requests;Entries=$entries}
 }

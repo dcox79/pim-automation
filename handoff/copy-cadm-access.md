@@ -1,4 +1,4 @@
-﻿# PIM access automation — operator runbook
+# PIM access automation — operator runbook
 
 **Status:** read [the project review](project-review.md) before applying access. The current
 engine has confirmed safety gaps. This runbook describes its behavior, not a production approval.
@@ -64,7 +64,8 @@ privilege; a group name or `isAssignableToRole` flag does not fully describe tha
 Example profiles: `reader-only`, `azure-owner-jit`, `m365-admin-jit`, `global-admin-jit`.
 All require tenant-specific review. Global Administrator eligibility is especially sensitive:
 approval, MFA/authentication context and activation duration come from the role's PIM policy.
-The current engine does not verify those safeguards before granting eligibility.
+Directory-role activation safeguards are not inspected. Azure-resource profiles now inspect
+MFA, approval, configured approvers, and activation duration through ARM.
 
 Legacy group and directory eligibility default to a bounded term. Legacy explicit group durations and clone end dates can bypass policy clamping; new exported profiles validate their terms before applying. Azure-resource clones may retain
 permanent eligibility if the source has no expiry. Preview output is not a guarantee that the
@@ -113,9 +114,11 @@ entries use `GroupId` and `AccessId`; directory entries use `RoleDefinitionId` a
 Administrative-unit and app-scoped directory roles are refused. The profile engine resolves IDs,
 checks tenant/scope ownership, and checks eligibility expiration policies before applying the new
 resource plane or exported Graph entries. Explicit terms that exceed policy are rejected.
-Existing eligibilities are retained without renewal or expiry reconciliation. The tool still does
-not verify activation MFA/approval settings, guarantee transactional rollback, or verify final
-provisioning completion. A successful request submission is not proof of completed assignment.
+Existing eligibilities are retained without renewal or expiry reconciliation. Both profile commands
+now verify exact assignments and submitted eligibility dates, and record per-entry final outcomes.
+A successful request submission alone is not success. Azure-resource profiles now check activation
+MFA, approval and duration as configured in Azure. Additional local requirements are opt-in. Group/directory activation
+policy checks and transactional rollback remain outside this feature.
 
 Use the updated launcher and libraries together. Exported profiles require profile engine 1.6.0
 or newer; older engines do not understand the new resource eligibility field.
@@ -163,10 +166,11 @@ Group governance checks additionally need `RoleManagementPolicy.Read.AzureADGrou
 Use it only when the caller's actual authority is understood. The launcher does not expose every
 clone-script option.
 
-Audit files default to `%LOCALAPPDATA%/PIM-Automation/cadm-clone/<date>/`; `-OutDir` overrides this.
+Clone audit files default to `%LOCALAPPDATA%/PIM-Automation/cadm-clone/<date>/`; `-OutDir` overrides this.
 They contain identities and access details and require controlled storage. Existing logs under
-older paths were not migrated or erased. Current JSON records the plan before confirmation and
-execution, not verified final outcomes.
+older paths were not migrated or erased. Clone JSON records the plan before confirmation and
+execution. Both profile commands additionally write per-assignment submissions and verified final
+outcomes; see the profile verification guide for locations and states.
 
 Exit codes: 0 generally means preview/completion/cancellation, 1 indicates a failed grant,
 2 indicates certain apply refusals. Incomplete discovery may still return success; automation
@@ -190,3 +194,7 @@ Profile role aliases/names resolve to canonical role IDs. Access-administration 
 Conditional RBAC/resource-PIM assignments are blocked instead of copied without conditions. Expiring active assignments are not converted to standing assignments. Incomplete relevant discovery refuses apply, including throttle/network failures and failed pagination.
 
 Run `tests/identity/Invoke-P1SafetyTests.ps1` in both PowerShell editions for offline behavioral checks. Live grants remain unverified; the original review's remaining P2 issues still apply.
+
+## Verified profile execution and broader export coverage
+
+See [profile verification and coverage](profile-verification-and-coverage.md) for generated descriptions, management-group discovery, additional scopes, optional group-derived evidence, final audit states, and expiry editing examples. These improvements apply to both profile commands; the separate clone engine retains its existing behavior.

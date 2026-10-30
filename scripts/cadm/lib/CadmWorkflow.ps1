@@ -1,5 +1,8 @@
 ﻿#requires -Version 5.1
 # Guided workflow helpers. Cloud writes remain in the existing profile engine.
+. (Join-Path $PSScriptRoot 'CadmAudit.ps1')
+. (Join-Path $PSScriptRoot 'CadmActivation.ps1')
+. (Join-Path $PSScriptRoot 'CadmBackup.ps1')
 function Get-WorkflowFileHash {
     param([string]$Path)
     $stream=[IO.File]::OpenRead($Path);$algorithm=[Security.Cryptography.SHA256]::Create()
@@ -53,7 +56,7 @@ function Save-WorkflowTemplate {
     if(-not $count){throw 'An empty template cannot be saved.'}
     $seen = @{}
     foreach ($entry in @(Get-ProfileEntries $Data.PimResourceEligibilities)) {
-        foreach ($k in $entry.Keys) { if ($k -notin @('RoleDefinitionId','Scope','Duration','StartDateTime','EndDateTime','SourceEndDateTime')) { throw "Unknown resource eligibility key: $k" } }
+        foreach ($k in $entry.Keys) { if ($k -notin @('RoleDefinitionId','Role','Scope','Duration','StartDateTime','EndDateTime','SourceEndDateTime')) { throw "Unknown resource eligibility key: $k" } }
         $identity = "$($entry.RoleDefinitionId)|$(Resolve-CadmScope $entry.Scope $Tenant)".ToLowerInvariant()
         if ($seen.ContainsKey($identity)) { throw 'Duplicate role/scope in template.' }; $seen[$identity] = $true
     }
@@ -62,15 +65,13 @@ function Save-WorkflowTemplate {
     # CreateNew is atomic and never overwrites another template.
     $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
     try { $bytes = [Text.UTF8Encoding]::new($true).GetBytes($literal); $stream.Write($bytes,0,$bytes.Length) } finally { $stream.Dispose() }
+    $snapshot=Backup-CadmProfileFiles -Tenant $Tenant -ProfilePaths @($path) -Reason 'Template created'
+    Write-Host "Local profile backup: $($snapshot.Path)"
     return $path
 }
 function Get-WorkflowFingerprint {
     param($Rows)
-    $items = @($Rows | ForEach-Object {
-        # Exclude computed start timestamps, retain actual policy-bounded duration/end date.
-        '{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}' -f $_.Plane,$_.Action,$_.Item,$_.Scope,$_.RoleDefinitionId,$_.AccessId,$_.ScheduleInfo.expiration.duration,$_.ScheduleInfo.expiration.endDateTime,$_.Detail
-    } | Sort-Object)
-    return ($items -join "`n")
+    return Get-CadmPlanFingerprint -Rows $Rows
 }
 function Get-WorkflowPlan {
     param($Profile,$Target,$Tenant,$Subs)
@@ -110,29 +111,9 @@ function Get-WorkflowResourceReport {
 }
 function Get-WorkflowVerification {
     param($Rows, $Target, $Profile, $Tenant, $Subs)
-    $results = @()
-    $resource = @(); $resourceError = $null; $fresh = @(); $planError = $null
-    try { $resource = @(Get-WorkflowResourceReport -Rows $Rows -Target $Target) } catch { $resourceError = $_.Exception.Message }
-    try { $fresh = @(Resolve-ProfilePlan -Profile $Profile -Target $Target -Tenant $Tenant -Subs $Subs) } catch { $planError = $_.Exception.Message }
-    foreach ($row in $Rows) {
-        $status = 'Pending'; $detail = 'Not observed yet'; $evidence = @()
-        if ($row.Plane -eq 'PIM-RES') {
-            if ($resourceError) { $status='Unknown'; $detail=$resourceError }
-            else {
-                $evidence = @($resource | Where-Object { $_.RoleDefinitionId -eq $row.RoleDefinitionId -and $_.Scope -ieq $row.Scope })
-                if (@($evidence | Where-Object { -not $_.Conditional -and $_.Status -eq 'Provisioned' -and $_.Classification -in @('Present','Expiring','Scheduled') }).Count) { $status='Provisioned'; $detail='Azure schedule instance read back' }
-                elseif (@($evidence | Where-Object Status -in @('Failed','Denied','Canceled','Revoked')).Count) { $status='Failed'; $detail='Azure returned a failed or revoked schedule' }
-            }
-        } elseif ($planError) { $status='Unknown'; $detail=$planError }
-        else {
-            $match = @($fresh | Where-Object { $_.Plane -eq $row.Plane -and $_.Item -eq $row.Item -and $_.Scope -ieq $row.Scope -and $_.Action -eq 'SKIP-EXISTS' })
-            if ($match.Count) { $status='Observed'; $detail='Existing assignment observed by profile discovery; provisioning status not exposed by this reader' }
-        }
-        $results += [pscustomobject]@{Plane=$row.Plane;Role=$row.Item;Scope=$row.Scope;Status=$status;Detail=$detail;Evidence=$evidence}
-    }
-    return $results
+    return @(Get-CadmProfileVerification -Rows $Rows -Target $Target)
 }
 function Write-WorkflowJson {
     param($Value,[string]$Path)
-    $Value | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $Path -Encoding utf8
+    Write-CadmAudit -Value $Value -Path $Path
 }

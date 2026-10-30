@@ -32,4 +32,7 @@
     # PIM policies refuse permanent assignment outright. Clamped down automatically where a
     # group's own policy sets a lower ceiling; a profile may pin its own term per eligibility.
     DefaultEligibilityDuration = 'P365D'
+
+    # Report Azure's configured activation settings. No additional local requirements.
+    ActivationRequirements = @{}
 }

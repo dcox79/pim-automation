@@ -38,6 +38,8 @@ function Test-Case {
         $target = @{ id = $script:targetId; accountEnabled = $true }
         $tenant = @{ TenantId = $script:ExpectedTenantId; ProfilesDir = (Join-Path $testRoot ([guid]::NewGuid().ToString())); DefaultEligibilityDuration = 'P30D'; ScopeTokens = @{} }
         New-Item -ItemType Directory -Path $tenant.ProfilesDir | Out-Null
+        $tenant.Path=Join-Path $testRoot ('tenant-'+[guid]::NewGuid()+'.psd1')
+        [IO.File]::WriteAllText($tenant.Path,'@{}')
         function Write-Host { }
         function Invoke-AzJsonRaw {
             param([string[]]$AzArgs)
@@ -60,7 +62,12 @@ function Test-Case {
             if ($Url -match 'next-page') { throw '429 partial page' }
             if ($Url -match 'roleManagementPolicyAssignments') {
                 if ($script:mode -eq 'unreadable-policy') { throw '403 policy' }
-                return @{ value = @(@{ properties = @{ roleDefinitionId = $script:roleId; effectiveRules = @(@{ id = 'Expiration_Admin_Eligibility'; maximumDuration = $script:maximum }) } }) }
+                return @{ value = @(@{ properties = @{ roleDefinitionId = $script:roleId; effectiveRules = @(
+                    @{ id = 'Expiration_Admin_Eligibility'; maximumDuration = $script:maximum },
+                    @{ id='Enablement_EndUser_Assignment';target=@{caller='EndUser';level='Assignment';operations=@('All')};enabledRules=@('MultiFactorAuthentication') },
+                    @{ id='Approval_EndUser_Assignment';target=@{caller='EndUser';level='Assignment';operations=@('All')};setting=@{isApprovalRequired=$true;approvalStages=@(@{primaryApprovers=@(@{id='88888888-8888-8888-8888-888888888888';userType='Group'})})} },
+                    @{ id='Expiration_EndUser_Assignment';target=@{caller='EndUser';level='Assignment';operations=@('All')};isExpirationRequired=$true;maximumDuration='PT2H' }
+                ) } }) }
             }
             if ($Url -match '/roleEligibilityScheduleInstances') {
                 $decoded = [uri]::UnescapeDataString($Url)
@@ -115,7 +122,7 @@ try {
         Assert-True ($data.Export.Planes.Count -eq 1 -and $data.Export.SubscriptionIds.Count -eq 2) 'Discovery coverage missing.'
         $prof = @(Get-CadmProfiles -ProfilesDir $tenant.ProfilesDir)[0]
         $plan = @(Resolve-ProfilePlan -Profile $prof -Target $target -Tenant $tenant -Subs @())
-        Assert-True ($plan.Count -eq 1 -and $plan[0].Plane -eq 'PIM-RES' -and $plan[0].Action -eq 'CREATE') 'Export cannot be previewed.'
+        Assert-True ($plan.Count -eq 1 -and $plan[0].Plane -eq 'PIM-RES' -and $plan[0].Action -eq 'CREATE') ("Export cannot be previewed: " + ($plan | ConvertTo-Json -Depth 15 -Compress))
         Assert-True ($script:writes.Count -eq 0) 'Export or preview wrote cloud access.'
     }
     Test-Case 'Profile eligibility apply uses AdminAssign eligibility and preserves expiry' {
@@ -213,7 +220,8 @@ try {
         $res = Invoke-ProfileGrant -Rows $plan -Target $target
         Assert-True ($res.Fail -eq 1 -and $script:writes.Count -eq 0) 'Stale policy allowed a write.'
         $script:mode = 'unreadable-policy'
-        Assert-Throws { Resolve-ProfilePlan -Profile $prof -Target $target -Tenant $tenant -Subs @() }
+        $blocked=@(Resolve-ProfilePlan -Profile $prof -Target $target -Tenant $tenant -Subs @())
+        Assert-True ($blocked[0].Action -eq 'BLOCKED-ACTIVATION-POLICY' -and $blocked[0].ActivationCheck.Status -eq 'Unknown') 'Unreadable activation policy must be visible and blocked.'
     }
     Test-Case 'Expired dates and invalid durations are refused' {
         foreach ($duration in @('garbage', 'P0D', '-P1D')) { Assert-Throws { Export-TestProfile -Duration $duration } }

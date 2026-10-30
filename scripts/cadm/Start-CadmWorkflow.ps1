@@ -10,6 +10,8 @@ param(
     [ValidateSet('Preview','Apply','Compare','Build','Import','Review')][string]$Action,
     [string]$TargetUser, [string]$ProfileName, [string]$ScopeToken,
     [string]$SourceUser, [switch]$Apply,
+    [ValidateSet('AzureResource','Group','DirectoryRole')][string[]]$ExportPlanes=@('AzureResource'),
+    [string[]]$AdditionalScopes, [switch]$IncludeManagementGroups, [switch]$IncludeGroupDerivedAccess,
     [string]$TemplateJson, [string]$OutDir,
     [ValidateRange(1,10)][int]$VerificationAttempts=3,
     [ValidateRange(0,30)][int]$VerificationDelaySeconds=5,
@@ -57,17 +59,26 @@ if ($Action -in @('Build','Import')) {
             $source=Resolve-WorkflowUser $SourceUser
             $scratch=Join-Path $OutDir ([guid]::NewGuid().ToString()); New-Item -ItemType Directory -Path $scratch | Out-Null
             $exportTenant=$tenant.Clone(); $exportTenant.ProfilesDir=$scratch
-            $export=Export-CadmEligibilityProfile -Source $source -Tenant $exportTenant -ProfileName 'reference' -Planes @('AzureResource')
+            if($IncludeGroupDerivedAccess -or $ExportPlanes -contains 'Group' -or $ExportPlanes -contains 'DirectoryRole'){
+                Connect-CadmExportGraph -Planes $ExportPlanes -IncludeGroupDerivedAccess:$IncludeGroupDerivedAccess
+            }
+            $export=Export-CadmEligibilityProfile -Source $source -Tenant $exportTenant -ProfileName 'reference' -Planes $ExportPlanes -AdditionalScopes $AdditionalScopes -IncludeManagementGroups:$IncludeManagementGroups -IncludeGroupDerivedAccess:$IncludeGroupDerivedAccess
+            if(-not $export.Path){Write-Host "No direct eligibilities to import. Coverage report: $($export.CoveragePath)";exit 0}
             $import=Import-PowerShellDataFile $export.Path
-            $entries=@($import.PimResourceEligibilities)
-            for($i=0;$i -lt $entries.Count;$i++){Write-Host "[$($i+1)] $($entries[$i].RoleDefinitionId) $($entries[$i].Scope) expiry=$($entries[$i].EndDateTime)"}
+            $entries=@()
+            foreach($plane in @('PimResourceEligibilities','PimGroupEligibilities','DirectoryRoleEligibilities')){
+                foreach($entry in @(Get-ProfileEntries $import[$plane])){$entries+=@{Plane=$plane;Entry=$entry}}
+            }
+            for($i=0;$i -lt $entries.Count;$i++){Write-Host "[$($i+1)] $($entries[$i].Plane) $($entries[$i].Entry | ConvertTo-Json -Compress)"}
             $selection=(Read-Host 'Select entry numbers separated by commas; no automatic all').Split(',')
             foreach($n in @($selection | Select-Object -Unique)) {
                 $index=0; if(-not [int]::TryParse($n.Trim(),[ref]$index) -or $index -lt 1 -or $index -gt $entries.Count){throw 'Invalid entry selection'}
-                $data.PimResourceEligibilities+=,$entries[$index-1]
+                $chosen=$entries[$index-1];$data[$chosen.Plane]+=,$chosen.Entry
             }
             $data.Export=$import.Export
-            Write-Host 'Imported direct Azure eligibility only. Exact scopes, future starts and finite expiries retained. Source inventory is private in the run output.'
+            if(-not $data.Name){$data.Name=$import.Name}
+            if(-not $data.Description){$data.Description=Get-CadmExportDescription -Data $data -Tenant $tenant}
+            Write-Host 'Selected direct eligibilities imported; group-derived evidence remains informational. Exact scopes and finite expiries retained.'
         } else {
             $catalog=@(Invoke-AzJson -AzArgs @('role','definition','list','--scope',$tenant.ScopeTokens[$ScopeToken],'-o','json'))
             if($script:LastAzError){throw $script:LastAzError}
@@ -80,7 +91,7 @@ if ($Action -in @('Build','Import')) {
                 $data.PimResourceEligibilities+=@{RoleDefinitionId=(Get-RoleDefGuid $catalog[$index-1].id);Scope='template-scope';Duration=$duration}
             }
         }
-        if(-not $data.PimResourceEligibilities.Count){throw 'Select at least one role'}
+        if(-not ($data.PimResourceEligibilities.Count+$data.PimGroupEligibilities.Count+$data.DirectoryRoleEligibilities.Count)){throw 'Select at least one eligibility'}
         $data.Metadata=@{SchemaVersion='1';Version='1.0.0';Owner=(Read-Host 'Template owner');Purpose=(Read-Host 'Business purpose');ReviewDate=(Read-Host 'Next review date (yyyy-MM-dd)');Status='Draft';DefaultScopeToken=$ScopeToken}
         Write-Host ($data | ConvertTo-Json -Depth 15)
         if((Read-Host 'Type REVIEWED to mark this template reviewed, or Enter to keep Draft') -ceq 'REVIEWED') {
@@ -110,13 +121,13 @@ if($Action -eq 'Review') {
     $m.ReviewDate=(Read-Host 'Next review date (yyyy-MM-dd)').Trim();$m.Reviewer=(Read-Host 'Reviewer identity').Trim()
     $m.Status='Reviewed';Assert-WorkflowMetadata $profile.Data -ForApply
     if((Read-Host 'Type REVIEWED to record this operator review; this does not grant access') -cne 'REVIEWED'){exit 0}
-    $backup=Join-Path $OutDir ("template-before-review-$([guid]::NewGuid()).psd1")
-    Copy-Item -LiteralPath $profile.Path -Destination $backup
+    $snapshot=Backup-CadmProfileFiles -Tenant $tenant -ProfilePaths @($profile.Path) -Reason 'Before template review edit'
+    $backup=$snapshot.Path
     $temp=Join-Path $tenant.ProfilesDir (".$([guid]::NewGuid()).psd1")
     try {
         [IO.File]::WriteAllText($temp,(ConvertTo-CadmPsdLiteral $profile.Data),[Text.UTF8Encoding]::new($true))
         $null=Import-PowerShellDataFile $temp
-        [IO.File]::Replace($temp,$profile.Path,$null)
+        [IO.File]::Replace($temp,$profile.Path,[NullString]::Value)
     } finally {if(Test-Path -LiteralPath $temp){Remove-Item -LiteralPath $temp}}
     Write-Host "Review recorded. Previous version saved to $backup. No access granted.";exit 0
 }
@@ -127,6 +138,8 @@ if(@($profile.Data.PimResourceEligibilities | Where-Object Scope -eq 'template-s
 }
 elseif($ScopeToken){throw 'Scope override requires a template using template-scope; fixed-scope templates cannot be retargeted.'}
 Assert-ProfileSafe -Profile $profile -Tenant $tenant
+$profileBackup=Backup-CadmProfileFiles -Tenant $tenant -ProfilePaths @($profile.Path) -Reason 'Workflow preview/apply/compare'
+Write-Host "Local profile backup: $($profileBackup.Path)"
 if(-not $TargetUser){$TargetUser=(Read-Host 'Target exact UPN or object ID').Trim()}
 $target=Resolve-WorkflowUser $TargetUser
 $acct=Invoke-AzJson -AzArgs @('account','show','-o','json')
@@ -134,63 +147,49 @@ $usesGroups=@(Get-ProfileEntries $profile.Data.PimGroupEligibilities).Count -or 
 $usesDirectory=@(Get-ProfileEntries $profile.Data.DirectoryRoleEligibilities).Count
 if($usesDirectory){$extra=if($Action -eq 'Apply'){$MgDirWriteScopeList}else{$MgDirReadScopeList};$MgScopeList=@($MgScopeList+$extra | Select-Object -Unique);$MgScopes=$MgScopeList -join ','}
 if($usesGroups -or $usesDirectory){Connect-GraphIfNeeded -ProbePrincipalId $target.id}
-$subs=Get-Subscriptions
+$subs=@() # Exact profile scopes are verified individually; no subscription inventory is needed.
 $rows=@(Get-WorkflowPlan -Profile $profile -Target $target -Tenant $tenant -Subs $subs)
 if(-not $rows.Count){throw 'Template resolved to an empty plan; review the template.'}
 $runId=[guid]::NewGuid().ToString();$runDir=Join-Path $OutDir $runId;New-Item -ItemType Directory -Path $runDir | Out-Null
 $hash=(Get-WorkflowFileHash $profile.Path)
 $tenantHash=(Get-WorkflowFileHash $tenant.Path)
-$review=[ordered]@{RunId=$runId;State='Preview';TimestampUtc=[datetimeoffset]::UtcNow.ToString('o');TenantId=$tenant.TenantId;Actor=$acct.user.name;Target=$target;Template=$ProfileName;TemplateHash=$hash;TenantHash=$tenantHash;Metadata=$profile.Data.Metadata;Plan=$rows;Coverage='Expected profile entries. Extra/renewal inventory: direct Azure-resource eligibilities at exact template scopes only; not all effective access.'}
+$review=[ordered]@{RunId=$runId;State='Preview';TimestampUtc=[datetimeoffset]::UtcNow.ToString('o');TenantId=$tenant.TenantId;Actor=$acct.user.name;Target=$target;Template=$ProfileName;TemplateHash=$hash;TenantHash=$tenantHash;BackupPath=$profileBackup.Path;Metadata=$profile.Data.Metadata;Plan=$rows;Coverage='Expected profile entries. Extra/renewal inventory: direct Azure-resource eligibilities at exact template scopes only; not all effective access.'}
 Write-WorkflowJson $review (Join-Path $runDir 'review.json')
 Write-Host "Target: $($target.displayName) <$($target.userPrincipalName)> [$($target.id)]"
 Write-Host "Template: $ProfileName v$($profile.Data.Metadata.Version) / $($profile.Data.Metadata.Status)"
 $rows | Select-Object Plane,Action,Item,Scope,@{n='EligibilityTerm';e={if($_.ScheduleInfo){$_.ScheduleInfo.expiration | ConvertTo-Json -Compress}elseif($_.Plane -in @('RBAC','GROUP')){'Standing access'}else{'Existing eligibility retained; expiry unchanged'}}} | Format-Table -Wrap | Out-Host
-Write-Host 'Management-group permissions extend to descendant scopes. Activation MFA/approval settings are not verified by this tool.'
+Show-CadmActivationChecks -Rows $rows
+Write-Host 'Management-group permissions extend to descendant scopes. Group/directory activation policy and Conditional Access behavior are not checked.'
 if($Action -eq 'Compare') {
     $inventory=@(Get-WorkflowResourceReport -Rows $rows -Target $target)
     Write-WorkflowJson @{RunId=$runId;ExpectedPlan=$rows;ResourceInventory=$inventory;Coverage=$review.Coverage} (Join-Path $runDir 'comparison.json')
     $inventory | Format-Table RoleDefinitionId,Classification,Status,EndDateTime -AutoSize | Out-Host
     Write-Host "Comparison saved to $runDir. Extra access is reported only; nothing removed or renewed.";exit 0
 }
-if($Action -eq 'Preview'){Write-Host "Preview saved to $runDir. Nothing changed.";exit 0}
-# Choosing Apply in the interactive menu is followed by the same exact-account confirmation.
-if(-not $Apply -and $PSBoundParameters.ContainsKey('Action')){throw 'Explicit -Action Apply also requires -Apply.'}
-if(@($rows | Where-Object {$_.Action -notin @('CREATE','SKIP-EXISTS')}).Count){throw 'Plan has blocked or unknown entries; refusing apply.'}
-$phrase="APPLY $($target.userPrincipalName)"
-if((Read-Host "Type $phrase to confirm these exact assignments") -cne $phrase){$review.State='Cancelled';Write-WorkflowJson $review (Join-Path $runDir 'review.json');exit 0}
-if((Get-WorkflowFileHash $profile.Path) -ne $hash -or (Get-WorkflowFileHash $tenant.Path) -ne $tenantHash){throw 'Configuration changed since review; preview again.'}
-Assert-CadmAzContext
-$reviewedUpn=$target.userPrincipalName
-$target=Resolve-WorkflowUser $target.id
-if($target.userPrincipalName -cne $reviewedUpn){throw 'Account changed since review; preview again.'}
-$fresh=@(Get-WorkflowPlan -Profile $profile -Target $target -Tenant $tenant -Subs $subs)
-if((Get-WorkflowFingerprint $fresh) -cne (Get-WorkflowFingerprint $rows)){throw 'Access or policy changed since review; preview again.'}
-$review.State='Applying';Write-WorkflowJson $review (Join-Path $runDir 'review.json')
-$writeError=$null;$result=@{Ok=0;Fail=0;Entries=@()};$verification=@()
+if($Action -eq 'Preview'){Write-Host "Preview saved to $runDir. Nothing changed.";if(@($rows | Where-Object {$_.Action -notin @('CREATE','SKIP-EXISTS')}).Count){exit 2};exit 0}
+# Confirmation and any subsequent refusal are recorded before returning.
 try {
-    foreach($row in @($fresh | Where-Object Action -eq 'CREATE')) {
-        $entry=@{Plane=$row.Plane;Role=$row.Item;Scope=$row.Scope;State='Submitting'}
-        $result.Entries+=,$entry
-        Write-WorkflowJson $result (Join-Path $runDir 'submissions.json')
-        try {
-            $submitted=Invoke-ProfileGrant -Rows @($row) -Target $target -Justification "$($tenant.JustificationPrefix): $($profile.Name) v$($profile.Data.Metadata.Version); run $runId" -DefaultDuration $tenant.DefaultEligibilityDuration
-            $result.Ok+=$submitted.Ok;$result.Fail+=$submitted.Fail
-            $entry.State=if($submitted.Fail){'Failed'}else{'Submitted'};$entry.Receipt=$submitted
-        } catch {$entry.State='Failed';$entry.Error=$_.Exception.Message;$result.Fail++}
-        Write-WorkflowJson $result (Join-Path $runDir 'submissions.json')
+    if(-not $Apply -and $PSBoundParameters.ContainsKey('Action')){throw 'Explicit -Action Apply also requires -Apply.'}
+    if(@($rows | Where-Object {$_.Action -notin @('CREATE','SKIP-EXISTS')}).Count){throw 'Plan has blocked or unknown entries; refusing apply.'}
+    $phrase="APPLY $($target.userPrincipalName)"
+    if((Read-Host "Type $phrase to confirm these exact assignments") -cne $phrase){
+        $review.State='Cancelled';Write-WorkflowJson $review (Join-Path $runDir 'review.json');exit 0
     }
-} catch {$writeError=$_.Exception.Message}
-finally {
-    for($attempt=1;$attempt -le $VerificationAttempts;$attempt++) {
-        $verification=@(Get-WorkflowVerification -Rows $rows -Target $target -Profile $profile -Tenant $tenant -Subs $subs)
-        if(-not @($verification | Where-Object Status -notin @('Provisioned','Observed')).Count){break}
-        if($attempt -lt $VerificationAttempts -and $VerificationDelaySeconds){Start-Sleep -Seconds $VerificationDelaySeconds}
-    }
-    $complete= $verification.Count -eq $rows.Count -and -not @($verification | Where-Object Status -notin @('Provisioned','Observed')).Count
-    $state=if($writeError -or ($result -and $result.Fail)){'Partial'}elseif($complete){'Verified'}else{'PendingOrUnknown'}
-    Write-WorkflowJson @{RunId=$runId;State=$state;CompletedUtc=[datetimeoffset]::UtcNow.ToString('o');TargetId=$target.id;TemplateHash=$hash;TemplateVersion=$profile.Data.Metadata.Version;Submission=$result;Error=$writeError;Verification=$verification} (Join-Path $runDir 'outcome.json')
-    $review.State=$state;Write-WorkflowJson $review (Join-Path $runDir 'review.json')
+    if((Get-WorkflowFileHash $profile.Path) -ne $hash -or (Get-WorkflowFileHash $tenant.Path) -ne $tenantHash){throw 'Configuration changed since review; preview again.'}
+    Assert-CadmAzContext
+    $reviewedUpn=$target.userPrincipalName
+    $target=Resolve-WorkflowUser $target.id
+    if($target.userPrincipalName -cne $reviewedUpn){throw 'Account changed since review; preview again.'}
+    $fresh=@(Get-WorkflowPlan -Profile $profile -Target $target -Tenant $tenant -Subs $subs)
+    if((Get-WorkflowFingerprint $fresh) -cne (Get-WorkflowFingerprint $rows)){throw 'Access or policy changed since review; preview again.'}
+}catch{
+    $review.State='Refused';$review.Error=$_.Exception.Message
+    Write-WorkflowJson $review (Join-Path $runDir 'review.json')
+    throw
 }
-$verification | Format-Table Plane,Role,Status,Scope -Wrap | Out-Host
-Write-Host "Outcome: $state. Evidence: $runDir"
-if($state -ne 'Verified'){exit 1}
+$review.State='Approved';Write-WorkflowJson $review (Join-Path $runDir 'review.json')
+$outcome=Invoke-CadmAuditedProfileApply -Rows $fresh -Target $target -Justification "$($tenant.JustificationPrefix): $($profile.Name) v$($profile.Data.Metadata.Version); run $runId" -DefaultDuration $tenant.DefaultEligibilityDuration -RunDirectory $runDir -Context $review -VerificationAttempts $VerificationAttempts -VerificationDelaySeconds $VerificationDelaySeconds
+$review.State=$outcome.State;Write-WorkflowJson $review (Join-Path $runDir 'review.json')
+$outcome.Verification | Format-Table Plane,Role,Status,Scope -Wrap | Out-Host
+Write-Host "Outcome: $($outcome.State). Evidence: $runDir"
+if($outcome.State -ne 'Verified'){exit 1}

@@ -79,6 +79,17 @@ function Resolve-CadmResourceEligibilityPlan {
     param($Entry, $Target, [hashtable]$Tenant)
     if (Test-CadmConditionalAssignment $Entry) { throw 'Conditional resource eligibility profiles are not supported.' }
     $scope = Resolve-CadmScope -Scope ([string]$Entry.Scope) -Tenant $Tenant
+    $requirements=Get-CadmActivationRequirements $Tenant
+    $activation=Get-CadmAzureActivationCheck -Scope $scope -RoleDefinitionId $Entry.RoleDefinitionId -Requirements $requirements
+    if($activation.Status -notin @('Pass','Observed')){
+        return [pscustomobject]@{
+            Plane='PIM-RES';Action='BLOCKED-ACTIVATION-POLICY';Item=$(if($Entry.Role){$Entry.Role}else{$Entry.RoleDefinitionId});Scope=$scope
+            RoleDefinitionId=$Entry.RoleDefinitionId;ArmRoleDefinitionId=$null
+            Detail=($activation.Reasons -join ' ');ActivationCheck=$activation;ActivationRequirements=$requirements
+            Duration=(Get-CadmField $Entry 'Duration');StartDateTime=(Get-CadmField $Entry 'StartDateTime')
+            EndDateTime=(Get-CadmField $Entry 'EndDateTime');ScheduleInfo=$null
+        }
+    }
     $role = Resolve-CadmEligibilityRole -RoleDefinitionId $Entry.RoleDefinitionId -Scope $scope
     $default = [string](Get-CadmField $Tenant 'DefaultEligibilityDuration')
     if (-not $default) { $default = 'P365D' }
@@ -105,13 +116,15 @@ function Resolve-CadmResourceEligibilityPlan {
         Detail = $(if ($found.Count) { 'Existing eligibility retained; no renewal or expiry change.' } else { 'Azure-resource eligibility only' })
         Duration = [string](Get-CadmField $Entry 'Duration'); EndDateTime = Get-CadmField $Entry 'EndDateTime'
         StartDateTime = Get-CadmField $Entry 'StartDateTime'; ScheduleInfo = $schedule
+        ActivationCheck=$activation;ActivationRequirements=$requirements
     }
 }
 function Invoke-CadmResourceEligibilityGrant {
     param($Item, $Target, [string]$Justification, [string]$TicketNumber, [string]$TicketSystem, [string]$DefaultDuration = 'P365D')
     # Recheck role, scope, policy, dates, and existing eligibility before writing.
-    $fresh = Resolve-CadmResourceEligibilityPlan -Entry $Item -Target $Target -Tenant @{ DefaultEligibilityDuration = $DefaultDuration }
-    if ($fresh.Action -eq 'SKIP-EXISTS') { return }
+    $fresh = Resolve-CadmResourceEligibilityPlan -Entry $Item -Target $Target -Tenant @{ DefaultEligibilityDuration = $DefaultDuration; ActivationRequirements=(Get-CadmField $Item 'ActivationRequirements') }
+    if ($fresh.Action -eq 'SKIP-EXISTS') { return @{State='Retained';ScheduleInfo=$fresh.ScheduleInfo} }
+    if($fresh.Action -ne 'CREATE'){throw "Azure activation policy blocks this grant: $($fresh.Detail)"}
     $properties = @{
         principalId = $Target.id; roleDefinitionId = $fresh.ArmRoleDefinitionId
         requestType = 'AdminAssign'; justification = $Justification; scheduleInfo = $fresh.ScheduleInfo
@@ -123,7 +136,11 @@ function Invoke-CadmResourceEligibilityGrant {
         $url = "$ArmBase$($fresh.Scope)/providers/Microsoft.Authorization/roleEligibilityScheduleRequests/$([guid]::NewGuid())?api-version=$PimApi"
         $response = Invoke-Rest -Url $url -Method put -BodyFile $bodyFile
         if ($script:LastAzError) { throw $script:LastAzError }
-        return @{ RequestId = $url.Split('?')[0]; Response = $response }
+        return @{ State='Submitted'; RequestId = $url.Split('?')[0]; Response = $response; ScheduleInfo=$fresh.ScheduleInfo }
+    } catch {
+        $_.Exception.Data['RequestId']=$url.Split('?')[0]
+        $_.Exception.Data['ScheduleInfo']=$fresh.ScheduleInfo
+        throw
     } finally {
         if (Test-Path -LiteralPath $bodyFile) { Remove-Item -LiteralPath $bodyFile -ErrorAction SilentlyContinue }
     }

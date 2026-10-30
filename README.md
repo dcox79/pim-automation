@@ -1,4 +1,4 @@
-﻿# Guided template workflow
+# Guided template workflow
 
 Use [Start-CadmWorkflow.ps1](scripts/cadm/Start-CadmWorkflow.ps1) for guided building/review, exact-account preview/apply, outcome verification and scoped comparison reports. See the [workflow guide](WORKFLOW-README.md). Only synthetic configuration is included. The legacy entry point below remains available.
 
@@ -32,6 +32,60 @@ See the [runbook](handoff/copy-cadm-access.md) for coverage and limitations.
 - A private tenant configuration with approved scopes and group mappings.
 
 Python and pytest are needed only for the optional source tests.
+
+## Optional terminal menu
+
+Run from your working checkout:
+
+```powershell
+.\scripts\cadm\Invoke-CadmAccess.ps1 -Tui
+```
+
+The persistent numbered menu lets you search for an account, select a profile, preview access,
+apply after preview and exact-account confirmation, or export eligibility to a new template.
+You can also browse and back up local profiles without signing in, and inspect recent menu reports.
+Enter a number to choose; press Enter or b to go back. Existing command-line commands still work.
+
+Each menu item explains what it reads, saves, or changes:
+
+| Option | What it does |
+| --- | --- |
+| 1. Preview access for a user | Shows proposed changes and blockers; grants nothing. |
+| 2. Assign access to a user | Previews, asks for exact-account confirmation, then submits grants and verifies results. |
+| 3. Create a profile from an existing user | Saves PIM eligibility and expiry dates as a new reusable access profile. |
+| 4. Read a saved profile | Shows the local recipe, without checking live user access. |
+| 5. Save a local backup | Copies tenant settings and profiles into a dated local folder. |
+| 6. Read previous results | Shows saved preview/apply reports, without refreshing Azure data. |
+| 7. Change connection and export settings | Controls optional Graph sign-in and group-derived export evidence. |
+| 8. Set up a tenant | Creates a new local tenant configuration and optional Reader template. |
+
+For a first run, choose **8**. A tenant configuration identifies your Azure directory and
+configured scope; an access profile lists permissions. The wizard asks for a folder name,
+display name, tenant ID, subscription or management-group scope, and default eligibility term.
+It offers either an empty profiles folder for a later PIM export (option 3), or a Reader starter
+template. Reader means standing read access at the selected scope if later applied; it is not
+PIM eligibility. Setup itself grants nothing, requires no sign-in, and creates no Azure tenant
+or resources. It shows a summary before saving, supports cancellation, and refuses existing
+folders or duplicate tenant IDs. Tenant and scope ownership are validated during subsequent
+cloud operations. The default eligibility term is editable and does not replace finite source
+expiry dates or change activation policies.
+
+The menu requires no new modules, accounts, repositories, or services. Cloud operations still
+need the same authorized Azure CLI session and permissions as the command-line operation.
+Automatic Graph PowerShell sign-in is off by default; account lookup uses the Azure CLI's
+existing Graph access. Enable Graph sign-in in option 7 only when needed
+for group or directory-role operations. Existing activation policy settings are reported;
+additional restrictions apply only when explicitly configured.
+
+Exports preserve source expiry and never overwrite a profile. Fixed-scope profiles keep their
+configured scopes. Portable templates offer a configured scope selection and retain the guided
+workflow's metadata/review requirements. Apply requires typing `APPLY <exact target UPN>`
+after reviewing the current plan; there is no menu option to bypass confirmation.
+
+Reports default to `%LOCALAPPDATA%\PIM-Automation\tui`; use `-Tui -OutDir <folder>`
+to choose another location. The recent-reports list covers that folder only. Local backups use
+the existing tenant backup location. For automation, continue using explicit CLI parameters.
+Direct launch is also available through `.\scripts\cadm\Start-CadmTui.ps1`.
 
 ## Configure and preview
 
@@ -115,9 +169,11 @@ entries use `GroupId` and `AccessId`; directory entries use `RoleDefinitionId` a
 Administrative-unit and app-scoped directory roles are refused. The profile engine resolves IDs,
 checks tenant/scope ownership, and checks eligibility expiration policies before applying the new
 resource plane or exported Graph entries. Explicit terms that exceed policy are rejected.
-Existing eligibilities are retained without renewal or expiry reconciliation. The tool still does
-not verify activation MFA/approval settings, guarantee transactional rollback, or verify final
-provisioning completion. A successful request submission is not proof of completed assignment.
+Existing eligibilities are retained without renewal or expiry reconciliation. Both profile commands
+now verify exact assignments and submitted eligibility dates, and record per-entry final outcomes.
+A successful request submission alone is not success. Azure-resource profiles now check activation
+MFA, approval and duration as configured in Azure. Additional local requirements are opt-in. Group/directory activation
+policy checks and transactional rollback remain outside this feature.
 
 Use the updated launcher and libraries together. Exported profiles require profile engine 1.6.0
 or newer; older engines do not understand the new resource eligibility field.
@@ -142,10 +198,14 @@ pwsh -NoProfile -File tests/identity/Invoke-ExportTests.ps1
 powershell -NoProfile -File tests/identity/Invoke-ExportTests.ps1
 ```
 
-The 95 Python tests inspect source text. Behavioral P1 tests exercise the real planning/write
+The Python suite checks source invariants and runs mocked launcher integration scenarios. Behavioral P1 tests exercise the real planning/write
 boundaries and clone entry point with mocked transports. Historical review probes now show both
 blocked paths and remaining P2 issues; their saved JSON files are the original pre-fix evidence.
 The export suite covers PSD1 round trips, all three eligibility planes, expiry, conditional/partial reads, policy changes, and mocked eligibility requests. No live grants are exercised. Live provisioning remains unverified.
 
 See the [operator runbook](handoff/copy-cadm-access.md), [review](handoff/project-review.md),
 and [changelog](CHANGELOG.md).
+
+## Verified profile execution and broader export coverage
+
+See [profile verification and coverage](handoff/profile-verification-and-coverage.md) for generated descriptions, management-group discovery, additional scopes, optional group-derived evidence, final audit states, and expiry editing examples. These improvements apply to both profile commands; the separate clone engine retains its existing behavior.

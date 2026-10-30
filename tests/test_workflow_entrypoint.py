@@ -1,10 +1,12 @@
-﻿import os, shutil, subprocess
+import os, shutil, subprocess
 from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE = r'''
 $script:planCalls=0;$script:submitted=$false
+$script:expectedStart=[datetimeoffset]::UtcNow.ToString('o')
+$script:expectedEnd=([datetimeoffset]$script:expectedStart).AddDays(365).ToString('o')
 $ArmBase='https://management.azure.com';$PimApi='2020-10-01';$script:LastAzError=$null
 function Initialize-AzInvoker {}
 function Assert-CadmAzContext {}
@@ -16,11 +18,12 @@ function Get-CadmField {param($Object,$Name) $Object.$Name}
 function Get-RoleDefGuid {param($Value) ($Value -split '/')[-1]}
 function Test-CadmConditionalAssignment {param($Record) [bool]$Record.condition}
 function ConvertTo-CadmEligibilityDate {param($Value) [datetimeoffset]$Value}
+function ConvertTo-CadmTimeSpan {param($Value) [System.Xml.XmlConvert]::ToTimeSpan($Value)}
 function Read-Host {param($Prompt) if($env:WORKFLOW_SCENARIO -eq 'cancel'){'cancel'}else{'APPLY person-cadm@example.com'}}
 function Invoke-CadmRestAll {param($Url)
  if($env:WORKFLOW_SCENARIO -eq 'read-error'){throw '403'}
  if($script:submitted -and $env:WORKFLOW_SCENARIO -ne 'partial') {
- @{id='assignment-id';properties=@{principalId='22222222-2222-2222-2222-222222222222';scope='/providers/Microsoft.Management/managementGroups/example';roleDefinitionId='/providers/Microsoft.Authorization/roleDefinitions/b24988ac-6180-42a0-ab88-20f7382dd24c';status=$(if($env:WORKFLOW_SCENARIO -eq 'pending'){'PendingApproval'}else{'Provisioned'});startDateTime='2026-01-01T00:00:00Z';endDateTime=[datetimeoffset]::UtcNow.AddDays(30).ToString('o')}}
+ @{id='assignment-id';properties=@{principalId='22222222-2222-2222-2222-222222222222';scope='/providers/Microsoft.Management/managementGroups/example';roleDefinitionId='/providers/Microsoft.Authorization/roleDefinitions/b24988ac-6180-42a0-ab88-20f7382dd24c';status=$(if($env:WORKFLOW_SCENARIO -eq 'pending'){'PendingApproval'}else{'Provisioned'});startDateTime=$script:expectedStart;endDateTime=$script:expectedEnd}}
  }
 }
 '''
@@ -36,12 +39,12 @@ function Get-ProfileEntries {param($Value) @($Value|Where-Object {$null -ne $_})
 function Assert-ProfileSafe {param($Profile,$Tenant)}
 function Resolve-ProfilePlan {param($Profile,$Target,$Tenant,$Subs)
  $script:planCalls++
- [pscustomobject]@{Plane='PIM-RES';Action='CREATE';Item='Contributor';Scope='/providers/Microsoft.Management/managementGroups/example';RoleDefinitionId='b24988ac-6180-42a0-ab88-20f7382dd24c';ScheduleInfo=@{expiration=@{duration=$(if($env:WORKFLOW_SCENARIO -eq 'stale' -and $script:planCalls -gt 1){'P30D'}else{'P365D'})}}}
+ [pscustomobject]@{Plane='PIM-RES';Action=$(if($env:WORKFLOW_SCENARIO -like 'blocked*'){'BLOCKED-ACTIVATION-POLICY'}else{'CREATE'});Item='Contributor';Scope='/providers/Microsoft.Management/managementGroups/example';RoleDefinitionId='b24988ac-6180-42a0-ab88-20f7382dd24c';ScheduleInfo=@{startDateTime=$script:expectedStart;expiration=@{type='afterDuration';duration=$(if($env:WORKFLOW_SCENARIO -eq 'stale' -and $script:planCalls -gt 1){'P30D'}else{'P365D'})}}}
 }
-function Invoke-ProfileGrant {param($Rows,$Target,$Justification,$DefaultDuration)
+function Invoke-ProfileGrant {param($Rows,$Target,$Justification,$DefaultDuration,$TicketNumber,$TicketSystem)
  $script:submitted=$true
  if($env:WORKFLOW_SCENARIO -eq 'partial'){throw 'simulated transport error'}
- @{Ok=1;Fail=0;Requests=@(@{RequestId='request-id'})}
+ @{Ok=1;Fail=0;Requests=@(@{RequestId='request-id'});Entries=@(@{State='Submitted';ScheduleInfo=$Rows[0].ScheduleInfo})}
 }
 '''
 
@@ -58,6 +61,9 @@ def test_real_workflow_entrypoint_offline(tmp_path, scenario, code, state, shell
     (lib/'tenant.psd1').write_text('@{}')
     (lib/'test.psd1').write_text('@{}')
     shutil.copyfile(ROOT/'scripts/cadm/lib/CadmWorkflow.ps1',lib/'CadmWorkflow.ps1')
+    shutil.copyfile(ROOT/'scripts/cadm/lib/CadmAudit.ps1',lib/'CadmAudit.ps1')
+    for name in ('CadmActivation.ps1', 'CadmBackup.ps1'):
+        shutil.copyfile(ROOT/'scripts/cadm/lib'/name,lib/name)
     out=tmp_path/'evidence'
     env=dict(os.environ,WORKFLOW_SCENARIO=scenario)
     command=[shell,'-NoProfile','-File',str(script),'-Action',{'preview':'Preview','compare':'Compare'}.get(scenario,'Apply'),'-ProfileName','test','-TargetUser','person-cadm@example.com','-OutDir',str(out),'-VerificationAttempts','1','-VerificationDelaySeconds','0']

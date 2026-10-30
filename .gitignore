@@ -29,3 +29,6 @@ publish/
 credentials*.json
 .azure/
 .mg/
+
+# Local recovery snapshots, including snapshots of example configurations.
+scripts/cadm/tenants/**/backups/
